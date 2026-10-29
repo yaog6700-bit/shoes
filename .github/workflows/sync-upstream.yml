@@ -70,5 +70,5 @@ jobs:
           git push -f origin "$TARGET_TAG"
 
           echo "Triggering Build Binaries workflow for $TARGET_TAG..."
-          gh workflow run "Build Binaries" --ref master
+          gh workflow run "Build Binaries" --repo "${{ github.repository }}" --ref master
           echo "Successfully triggered build workflow!"
