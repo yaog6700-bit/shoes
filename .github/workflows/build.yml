@@ -152,7 +152,9 @@ jobs:
           if [ -n "${{ github.ref_name }}" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
             echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
-            echo "tag=v0.3.6" >> $GITHUB_OUTPUT
+            git fetch --tags || true
+            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.3.6")
+            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
           fi
 
       - name: Create Release

@@ -1,0 +1,74 @@
+name: Sync Upstream & Auto Build
+
+on:
+  schedule:
+    # 每天每 6 小时自动检查一次原项目是否有新版本
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # 支持在 GitHub 网页手动点击一键检查同步
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  check-and-sync:
+    name: Check and Sync Upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check latest upstream release
+        id: check_upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(gh api repos/cfal/shoes/releases/latest --jq .tag_name 2>/dev/null || echo "")
+          if [ -z "$UPSTREAM_TAG" ]; then
+            UPSTREAM_TAG=$(gh api repos/cfal/shoes/tags --jq '.[0].name' 2>/dev/null || echo "")
+          fi
+          echo "Upstream latest release tag: $UPSTREAM_TAG"
+          echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+
+          OUR_RELEASE=$(gh api repos/${{ github.repository }}/releases/tags/$UPSTREAM_TAG --jq .tag_name 2>/dev/null || echo "")
+          echo "Our current release for $UPSTREAM_TAG: $OUR_RELEASE"
+
+          if [ -n "$UPSTREAM_TAG" ] && [ "$OUR_RELEASE" != "$UPSTREAM_TAG" ]; then
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync upstream code and trigger build
+        if: steps.check_upstream.outputs.needs_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_TAG="${{ steps.check_upstream.outputs.upstream_tag }}"
+          echo "Starting synchronization for new version: $TARGET_TAG"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/cfal/shoes.git || true
+          git fetch upstream --tags
+
+          # Merge upstream master while protecting our custom workflow files
+          git checkout master
+          git merge upstream/master -m "chore: sync upstream $TARGET_TAG" || {
+            echo "Resolving merge conflicts by preserving our workflows..."
+            git checkout --ours .github/workflows/
+            git add .github/workflows/
+            git commit -m "chore: preserve custom workflows for $TARGET_TAG"
+          }
+
+          # Update the tag locally and push both master and the tag
+          git tag -f "$TARGET_TAG"
+          git push origin master
+          git push -f origin "$TARGET_TAG"
+
+          echo "Triggering Build Binaries workflow for $TARGET_TAG..."
+          gh workflow run "Build Binaries" --ref master
+          echo "Successfully triggered build workflow!"
