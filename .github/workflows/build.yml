@@ -2,10 +2,7 @@ name: Build Binaries
 
 on:
   push:
-    branches: [ master ]
     tags: [ 'v*' ]
-  pull_request:
-    branches: [ master ]
   workflow_dispatch:
 
 permissions:
@@ -13,7 +10,7 @@ permissions:
 
 concurrency:
   group: binaries-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,7 +51,7 @@ jobs:
             use_cross: true
             binary_name: shoes
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
             use_cross: false
             binary_name: shoes
           - target: aarch64-apple-darwin
@@ -131,6 +128,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Download verified archives
@@ -152,7 +150,7 @@ jobs:
           if [ -n "${{ github.ref_name }}" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
             echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
-            git fetch --tags || true
+            git fetch --tags --force || true
             LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.3.6")
             echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
           fi
