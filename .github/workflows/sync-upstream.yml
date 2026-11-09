@@ -53,26 +53,29 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Backup custom workflow files before resetting to upstream tag
-          cp .github/workflows/build.yml "$RUNNER_TEMP/build.yml"
-          cp .github/workflows/sync-upstream.yml "$RUNNER_TEMP/sync-upstream.yml"
+          # Backup entire .github/workflows directory so GITHUB_TOKEN never modifies workflow files
+          cp -R .github/workflows "$RUNNER_TEMP/workflows"
 
           git remote add upstream https://github.com/cfal/shoes.git || true
-          git fetch upstream --tags --force
+          git fetch upstream "refs/tags/$TARGET_TAG:refs/tags/upstream-$TARGET_TAG" --force
 
-          # Reset master cleanly to the exact upstream release tag commit (zero conflict risk)
-          git checkout -B master "refs/tags/$TARGET_TAG"
+          # Overlay exact upstream release files onto current master without importing upstream workflow commits
+          git checkout master
+          git rm -rf .
+          git checkout "refs/tags/upstream-$TARGET_TAG" -- .
 
-          # Restore custom workflow files on top of the upstream release
-          mkdir -p .github/workflows
-          cp "$RUNNER_TEMP/build.yml" .github/workflows/build.yml
-          cp "$RUNNER_TEMP/sync-upstream.yml" .github/workflows/sync-upstream.yml
-          git add .github/workflows/build.yml .github/workflows/sync-upstream.yml
-          git commit -m "ci: sync upstream $TARGET_TAG with Windows release workflows"
+          # Restore exact .github/workflows directory from origin/master (zero workflow file diff)
+          rm -rf .github/workflows
+          cp -R "$RUNNER_TEMP/workflows" .github/workflows
 
-          # Update the tag locally and force-push both master and the tag
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync upstream $TARGET_TAG"
+          fi
+
+          # Create/update release tag on this synced commit and push
           git tag -f "$TARGET_TAG"
-          git push -f origin master
+          git push origin master
           git push -f origin "$TARGET_TAG"
 
           echo "Triggering Build Binaries workflow for $TARGET_TAG..."
