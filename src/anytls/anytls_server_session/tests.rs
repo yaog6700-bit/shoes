@@ -2,12 +2,87 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time::{Duration, timeout};
 
+async fn read_frame(stream: &mut tokio::io::DuplexStream) -> Frame {
+    timeout(Duration::from_secs(5), async {
+        let mut header = [0; FRAME_HEADER_SIZE];
+        stream.read_exact(&mut header).await.unwrap();
+        let length = u16::from_be_bytes([header[5], header[6]]) as usize;
+        let mut wire = BytesMut::from(header.as_slice());
+        wire.resize(FRAME_HEADER_SIZE + length, 0);
+        stream
+            .read_exact(&mut wire[FRAME_HEADER_SIZE..])
+            .await
+            .unwrap();
+        FrameCodec::decode(&mut wire).unwrap().unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn padding_segments_preserve_empty_mixed_and_payload_only_writes() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    #[derive(Debug, PartialEq)]
+    enum WriteEvent {
+        Data(Vec<u8>),
+        Flush,
+    }
+
+    struct RecordingWriter(Arc<SyncMutex<Vec<WriteEvent>>>);
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.lock().push(WriteEvent::Data(data.to_vec()));
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.lock().push(WriteEvent::Flush);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    timeout(Duration::from_secs(5), async {
+        for case in crate::anytls::anytls_padding::padding_write_cases() {
+            let sizes = case.sizes;
+            let payload_len = case.payload.len();
+            let padding =
+                Arc::new(PaddingFactory::new(format!("stop=8\n1={sizes}").as_bytes()).unwrap());
+            let (transport, _peer) = duplex(1);
+            let session = AnyTlsSession::new_server_test(transport, padding);
+            let events = Arc::new(SyncMutex::new(Vec::new()));
+            *session.writer.lock().await = Box::new(RecordingWriter(events.clone()));
+            let mut expected_events: Vec<_> =
+                case.writes.into_iter().map(WriteEvent::Data).collect();
+            expected_events.push(WriteEvent::Flush);
+            session.write_with_padding(case.payload, 1).await.unwrap();
+            assert_eq!(
+                *events.lock(),
+                expected_events,
+                "sizes={sizes}, payload_len={payload_len}"
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn fake_dns_udp_modes() {
     use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
     timeout(Duration::from_secs(10), async {
         for fixed in [false, true] {
-            for case in [UdpCase::Dns, UdpCase::Tls, UdpCase::Http] {
+            for case in UdpCase::ALL {
                 let mut tasks = tokio::task::JoinSet::new();
                 let fixture = UdpFixture::new(case, &mut tasks).await;
                 let mode = if fixed {
@@ -38,8 +113,13 @@ async fn fake_dns_udp_modes() {
                         .await
                         .unwrap();
                     let magic = NetLocation::from_str(UOT_V2_MAGIC_ADDRESS, Some(0)).unwrap();
-                    let mut header = crate::socks_handler::write_location_to_vec(&magic);
+                    let mut header = crate::socks_handler::write_location_to_vec(&magic).unwrap();
                     header.extend(fixture.uot_header(fixed));
+                    let eager =
+                        fixed && id == 2 && matches!(case, UdpCase::Dtls | UdpCase::StunHostname);
+                    if eager {
+                        header.extend(fixture.request(mode));
+                    }
                     peer.write_all(&Frame::data(id, Bytes::from(header)).encode())
                         .await
                         .unwrap();
@@ -54,11 +134,13 @@ async fn fake_dns_udp_modes() {
                     assert_eq!(&status, &Frame::control(Command::SynAck, id).encode()[..]);
                     // The second stream proves the session survives; DNS supports repeated queries.
                     if id == 2 || case == UdpCase::Dns {
-                        peer.write_all(
-                            &Frame::data(id, Bytes::from(fixture.request(mode))).encode(),
-                        )
-                        .await
-                        .unwrap();
+                        if !eager {
+                            peer.write_all(
+                                &Frame::data(id, Bytes::from(fixture.request(mode))).encode(),
+                            )
+                            .await
+                            .unwrap();
+                        }
                         let mut reply = Vec::new();
                         loop {
                             peer.read_exact(&mut status).await.unwrap();
@@ -135,7 +217,7 @@ async fn fake_dns_adapter_contract() {
                 peer.write_all(
                     &Frame::data(
                         2,
-                        Bytes::from(crate::socks_handler::write_location_to_vec(&target)),
+                        Bytes::from(crate::socks_handler::write_location_to_vec(&target).unwrap()),
                     )
                     .encode(),
                 )
@@ -190,8 +272,7 @@ async fn unknown_fake_destinations_send_error_synack_then_fin() {
         timeout(Duration::from_secs(5), async {
             let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
             let context = Arc::new(
-                crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
-                    .unwrap(),
+                crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap(),
             );
             let selector =
                 ClientProxySelector::new(vec![crate::client_proxy_selector::ConnectRule::new(
@@ -336,6 +417,171 @@ async fn sniff_failures_send_one_synack_then_fin() {
             })
             .await
             .unwrap();
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_failures_without_sniffing_distinguish_policy_blocks_from_dial_errors() {
+    use crate::rules::Expression;
+    for (condition, kind, message) in [
+        (
+            Expression::Never,
+            io::ErrorKind::ConnectionRefused,
+            "UDP blocked by rules",
+        ),
+        (
+            Expression::AnyDestination(true),
+            io::ErrorKind::PermissionDenied,
+            "UDP connect failed: test UDP dial failure",
+        ),
+    ] {
+        let (transport, mut peer) = duplex(8192);
+        let session = AnyTlsSession::new_server_with_initial_data(
+            transport,
+            PaddingFactory::default_factory(),
+            Arc::new(crate::resolver::NativeResolver),
+            crate::routing::ingress::tests::udp_failure_selector(
+                condition,
+                io::ErrorKind::PermissionDenied,
+            ),
+            true,
+            "test".into(),
+            None,
+        );
+        session.peer_version.store(2, Ordering::Relaxed);
+        let (_sender, receiver) = mpsc::channel(1);
+        let stream = AnyTlsStream::new(
+            1,
+            receiver,
+            session.outgoing_tx.clone(),
+            session.is_closed.clone(),
+        );
+        let error = timeout(
+            Duration::from_secs(5),
+            session.handle_uot_v2_connect(
+                stream,
+                NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), kind);
+        let status = read_frame(&mut peer).await;
+        assert_eq!(status.cmd, Command::SynAck);
+        assert_eq!(status.stream_id, 1);
+        assert_eq!(status.data.as_ref(), message.as_bytes());
+        assert_eq!(
+            session.outgoing_rx.lock().await.try_recv().unwrap(),
+            (1, Bytes::new())
+        );
+        assert!(!session.is_closed());
+        drop(session);
+        let mut extra = Vec::new();
+        peer.read_to_end(&mut extra).await.unwrap();
+        assert!(extra.is_empty(), "second status after failure SYNACK");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_optimistic_failures_wait_for_fin_or_close_the_session() {
+    for (failure, kind) in [
+        ("block", io::ErrorKind::ConnectionRefused),
+        ("dial", io::ErrorKind::PermissionDenied),
+        ("read", io::ErrorKind::UnexpectedEof),
+    ] {
+        for drain in [true, false] {
+            let (transport, mut peer) = duplex(8192);
+            let session = AnyTlsSession::new_server_with_initial_data(
+                transport,
+                PaddingFactory::default_factory(),
+                Arc::new(crate::resolver::NativeResolver),
+                crate::routing::ingress::tests::protocol_failure_selector(failure == "block"),
+                true,
+                "test".into(),
+                None,
+            );
+            session.peer_version.store(2, Ordering::Relaxed);
+            while session.outgoing_tx.capacity() > 0 {
+                session
+                    .outgoing_tx
+                    .try_send((2, Bytes::from_static(b"sibling")))
+                    .unwrap();
+            }
+            let (sender, receiver) = mpsc::channel(1);
+            let stream = AnyTlsStream::new(
+                1,
+                receiver,
+                session.outgoing_tx.clone(),
+                session.is_closed.clone(),
+            );
+            let handler = session.clone();
+            let forwarding = tokio::spawn(async move {
+                handler
+                    .handle_uot_v2_connect(
+                        stream,
+                        NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+                    )
+                    .await
+            });
+            let status = read_frame(&mut peer).await;
+            assert_eq!(status.encode(), Frame::control(Command::SynAck, 1).encode());
+            let payload = if failure == "read" {
+                vec![0, 20, 0]
+            } else {
+                crate::routing::ingress::tests::PacketMode::Fixed.packet(
+                    &NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+                    &crate::sniff::udp::tests::stun_packet(),
+                )
+            };
+            sender.send(Bytes::from(payload)).await.unwrap();
+            if failure == "read" {
+                sender.send(Bytes::new()).await.unwrap();
+            }
+            sender.closed().await;
+            tokio::task::yield_now().await;
+            assert!(
+                !forwarding.is_finished(),
+                "FIN must wait for capacity: {failure}"
+            );
+            let finishing = tokio::time::Instant::now();
+            if drain {
+                assert_eq!(session.outgoing_rx.lock().await.try_recv().unwrap().0, 2);
+            }
+            let error = forwarding.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), kind, "{failure}: {error}");
+            assert_eq!(session.is_closed(), !drain);
+            assert_eq!(
+                finishing.elapsed(),
+                if drain {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(5)
+                }
+            );
+            if drain {
+                let mut outgoing = session.outgoing_rx.lock().await;
+                loop {
+                    let (id, data) = outgoing.try_recv().unwrap();
+                    if id == 1 {
+                        assert!(data.is_empty());
+                        break;
+                    }
+                    assert_eq!(id, 2);
+                }
+                assert!(outgoing.try_recv().is_err(), "duplicate FIN");
+                drop(outgoing);
+                session.send_synack(2, None).await.unwrap();
+                assert_eq!(
+                    read_frame(&mut peer).await.encode(),
+                    Frame::control(Command::SynAck, 2).encode()
+                );
+            }
+            drop(session);
+            let mut extra = Vec::new();
+            peer.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty(), "second response after optimistic success");
         }
     }
 }
@@ -563,8 +809,8 @@ async fn cancelled_flows_release_reads_and_egress_before_bounded_fin() {
                 )
             } else {
                 crate::tcp::chain_builder::try_build_client_proxy_chain(
-                    crate::option_util::OneOrSome::One(crate::config::ClientChainHop::Single(
-                        crate::config::ConfigSelection::Config(client),
+                    crate::option_util::OneOrSome::One(crate::config::ResolvedClientHop::Single(
+                        crate::config::test_support::client(client),
                     )),
                     resolver.clone(),
                 )
@@ -1017,26 +1263,26 @@ async fn test_session_rejects_syn_without_settings() {
     let session = AnyTlsSession::new_server_test(client, padding);
 
     let session_clone = Arc::clone(&session);
-    let run_task = tokio::spawn(async move {
-        let _ = session_clone.run().await;
-    });
+    let run_task =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move { session_clone.run().await },
+        ));
 
     // Send SYN without Settings first
     let syn_frame = Frame::control(Command::Syn, 1);
     server.write_all(&syn_frame.encode()).await.unwrap();
 
-    // Should receive Alert
-    let mut buf = vec![0u8; 256];
-    let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
-
-    if let Ok(Ok(n)) = result
-        && n > 0
-    {
-        assert_eq!(buf[0], Command::Alert as u8);
-    }
-
-    session.close().await;
-    run_task.abort();
+    let frame = read_frame(&mut server).await;
+    assert_eq!(frame.cmd, Command::Alert);
+    assert_eq!(frame.stream_id, 0);
+    assert_eq!(frame.data.as_ref(), b"client did not send its settings");
+    let error = timeout(Duration::from_secs(5), run_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(session.is_closed());
 }
 
 #[tokio::test]
@@ -1046,9 +1292,10 @@ async fn test_heartbeat_response() {
     let session = AnyTlsSession::new_server_test(client, padding);
 
     let session_clone = Arc::clone(&session);
-    let run_task = tokio::spawn(async move {
-        let _ = session_clone.run().await;
-    });
+    let run_task =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move { session_clone.run().await },
+        ));
 
     // Send settings first
     let mut settings = StringMap::new();
@@ -1057,26 +1304,31 @@ async fn test_heartbeat_response() {
     let settings_frame = Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
     server.write_all(&settings_frame.encode()).await.unwrap();
 
-    // Wait for and consume the ServerSettings response
-    let mut buf = vec![0u8; 128];
-    let _ = timeout(Duration::from_millis(200), server.read(&mut buf)).await;
+    let settings = read_frame(&mut server).await;
+    assert_eq!(settings.cmd, Command::ServerSettings);
+    assert_eq!(settings.stream_id, 0);
+    assert_eq!(
+        StringMap::from_bytes(&settings.data)
+            .get("v")
+            .map(String::as_str),
+        Some("2")
+    );
 
     // Send heartbeat request
     let heart_request = Frame::control(Command::HeartRequest, 0);
     server.write_all(&heart_request.encode()).await.unwrap();
 
-    // Should receive heartbeat response
-    let mut response_buf = vec![0u8; 16];
-    let result = timeout(Duration::from_millis(500), server.read(&mut response_buf)).await;
-
-    if let Ok(Ok(n)) = result
-        && n >= 7
-    {
-        assert_eq!(response_buf[0], Command::HeartResponse as u8);
-    }
+    let response = read_frame(&mut server).await;
+    assert_eq!(response.cmd, Command::HeartResponse);
+    assert_eq!(response.stream_id, 0);
+    assert!(response.data.is_empty());
 
     session.close().await;
-    run_task.abort();
+    timeout(Duration::from_secs(5), run_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 // ===== Frame parsing edge case tests =====
@@ -1290,9 +1542,10 @@ async fn test_session_update_padding_scheme() {
     let session = AnyTlsSession::new_server_test(client, padding);
 
     let session_clone = Arc::clone(&session);
-    let run_task = tokio::spawn(async move {
-        let _ = session_clone.run().await;
-    });
+    let run_task =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move { session_clone.run().await },
+        ));
 
     // Send settings with mismatched padding MD5
     let mut settings = StringMap::new();
@@ -1301,21 +1554,18 @@ async fn test_session_update_padding_scheme() {
     let settings_frame = Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
     server.write_all(&settings_frame.encode()).await.unwrap();
 
-    // Should receive UpdatePaddingScheme frame
-    let mut buf = vec![0u8; 256];
-    let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
-
-    if let Ok(Ok(n)) = result
-        && n >= 7
-    {
-        // Could be ServerSettings or UpdatePaddingScheme
-        // Either is valid response
-        let cmd = buf[0];
-        assert!(cmd == Command::UpdatePaddingScheme as u8 || cmd == Command::ServerSettings as u8);
-    }
+    let update = read_frame(&mut server).await;
+    assert_eq!(update.cmd, Command::UpdatePaddingScheme);
+    assert_eq!(update.stream_id, 0);
+    assert_eq!(update.data.as_ref(), session.padding.raw_scheme());
+    assert_eq!(read_frame(&mut server).await.cmd, Command::ServerSettings);
 
     session.close().await;
-    run_task.abort();
+    timeout(Duration::from_secs(5), run_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

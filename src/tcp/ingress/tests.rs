@@ -161,9 +161,8 @@ async fn connection_notes_tcp_udp_setup_and_failures_have_no_history() {
 async fn connection_notes_local_dns_releases_admission_before_routing() {
     use crate::control::connection_notes::MAX_FLOWS;
     let (selector, resolver, registry) = notes_fixture("success");
-    let context = Arc::new(
-        crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
-    );
+    let context =
+        Arc::new(crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap());
     let selector = selector.with_fake_dns_context(Some(context)).unwrap();
     let prepared = PreparedTcp::new(
         &selector,
@@ -216,7 +215,7 @@ async fn connection_notes_saturated_ingress_does_not_retry_at_dial() {
 }
 
 #[derive(Debug)]
-struct FailedConnector;
+struct FailedConnector(io::ErrorKind);
 
 #[async_trait::async_trait]
 impl SocketConnector for FailedConnector {
@@ -225,10 +224,7 @@ impl SocketConnector for FailedConnector {
         _: &Arc<dyn Resolver>,
         _: &ResolvedLocation,
     ) -> io::Result<Box<dyn AsyncStream>> {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "test dial failure",
-        ))
+        Err(io::Error::new(self.0, "test dial failure"))
     }
 
     async fn connect_udp_bidirectional(
@@ -245,13 +241,21 @@ impl SocketConnector for FailedConnector {
 }
 
 pub(crate) fn failure_selector(sniff: bool, blocked: bool) -> Arc<ClientProxySelector> {
+    failure_selector_with_error(sniff, blocked, io::ErrorKind::ConnectionRefused)
+}
+
+pub(crate) fn failure_selector_with_error(
+    sniff: bool,
+    blocked: bool,
+    kind: io::ErrorKind,
+) -> Arc<ClientProxySelector> {
     let action = if blocked {
         ConnectAction::Block
     } else {
         ConnectAction::new_allow(
             None,
             ClientChainGroup::new(vec![ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Arc::new(FailedConnector))],
+                vec![InitialHopEntry::Direct(Arc::new(FailedConnector(kind)))],
                 vec![],
             )]),
         )
@@ -282,7 +286,7 @@ async fn socks_target_at(
     tasks: &mut JoinSet<()>,
 ) -> (Arc<ClientProxySelector>, Arc<dyn Resolver>) {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let rule = serde_yaml::from_str(&format!(
+    let rule = crate::config::test_support::from_yaml(&format!(
         "masks: {mask}\nclient_proxy:\n  address: '127.0.0.1:{}'\n  protocol: {{type: socks}}\n",
         listener.local_addr().unwrap().port(),
     ))
@@ -380,9 +384,8 @@ impl FakeTcpCase {
                 Arc::new(crate::resolver::NativeResolver::new()) as Arc<dyn Resolver>,
             )
         };
-        let context = Arc::new(
-            crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
-        );
+        let context =
+            Arc::new(crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let target = match self {
             Self::Dns => NetLocation::from_str("198.18.0.1:53", None).unwrap(),
             Self::Unknown => NetLocation::from_str("198.18.0.1:443", None).unwrap(),
@@ -425,15 +428,16 @@ impl FakeTcpCase {
 async fn http_host_routes_only_the_original_destination_and_port() {
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     for fake in [false, true] {
-        let context = Arc::new(
-            crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
-        );
+        let context =
+            Arc::new(crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let target = if fake {
             NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
         } else {
             NetLocation::from_str(TARGET, None).unwrap()
         };
-        let rule = serde_yaml::from_str("masks: sniff.example:443\naction: allow").unwrap();
+        let rule =
+            crate::config::test_support::from_yaml("masks: sniff.example:443\naction: allow")
+                .unwrap();
         let selector = crate::tcp::tcp_client_handler_factory::create_test_selector(
             vec![rule],
             resolver.clone(),
@@ -469,25 +473,25 @@ async fn http_host_routes_only_the_original_destination_and_port() {
 
 #[tokio::test]
 async fn http_sniff_example_blocks_private_targets_before_host_allows() {
-    use crate::config::{Config, ConfigSelection, ServerProxyConfig};
+    use crate::config::ResolvedServerProxyConfig;
 
     let mut configs = crate::config::create_server_configs(
         serde_yaml::from_str(include_str!("../../../examples/http_host_sniffing.yaml")).unwrap(),
     )
     .unwrap();
-    let Config::Server(config) = configs.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(config) = configs.configs.remove(0) else {
         panic!("expected server config")
     };
     assert!(matches!(
         config.protocol,
-        ServerProxyConfig::Socks {
+        ResolvedServerProxyConfig::Socks {
             username: Some(_),
             password: Some(_),
             ..
         }
     ));
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-    let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
+    let rules = config.rules.into_vec();
     let selector =
         crate::tcp::tcp_client_handler_factory::create_test_selector(rules, resolver.clone())
             .unwrap()
@@ -533,7 +537,7 @@ async fn http_sniff_example_blocks_private_targets_before_host_allows() {
 async fn http_sniff_eligibility_and_misses_keep_ordinary_routing() {
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     for enabled in [false, true] {
-        let rules = serde_yaml::from_str(
+        let rules = crate::config::test_support::from_yaml(
             "- masks: sniff.example\n  action: block\n- masks: 0.0.0.0/0\n  action: allow",
         )
         .unwrap();
@@ -584,10 +588,10 @@ async fn http_sniff_eligibility_and_misses_keep_ordinary_routing() {
 
 #[tokio::test]
 async fn local_dns_is_ready_without_a_query_and_fake_names_are_probed() {
-    use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
+    use crate::dns::DnsContext;
+    use crate::dns::fake_ip::FakeIpOptions;
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-    let context =
-        Arc::new(FakeDnsContext::new(FakeIpOptions::default(), resolver.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(FakeIpOptions::default(), resolver.clone()).unwrap());
     let selector = ClientProxySelector::new(vec![crate::client_proxy_selector::ConnectRule::new(
         vec![crate::address::NetLocationMask::from("sniff.example").unwrap()],
         crate::client_proxy_selector::ConnectAction::Block,

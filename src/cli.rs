@@ -10,6 +10,8 @@ use crate::shadowsocks::ShadowsocksCipher;
 use crate::thread_util::set_num_threads;
 use crate::{logging, process, uuid_util};
 
+mod tendns_generator;
+
 fn print_usage_and_exit(arg0: String) -> ! {
     eprintln!("{arg0} [OPTIONS] <config.yaml> [config.yaml...]");
     eprintln!();
@@ -23,20 +25,25 @@ fn print_usage_and_exit(arg0: String) -> ! {
     );
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
     eprintln!(
-        "    global_limits.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
+        "    global_settings.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
     );
     eprintln!("    QUIC connections disconnect immediately on reload.");
-    eprintln!("    -V, --version        Print version information and exit");
+    eprintln!("    -V                   Print the short version and exit");
+    eprintln!("    --version            Print version, target, and compiler and exit");
     eprintln!();
     eprintln!("RESOURCE LIMITS:");
-    eprintln!("    Optional YAML entry: - global_limits: {{ max_connections: 1024 }}");
+    eprintln!("    Optional YAML entry: - global_settings: {{ max_connections: 1024 }}");
     eprintln!(
-        "    Admission is unlimited unless configured. Only one global_limits entry is allowed."
+        "    Admission is unlimited unless configured. Only one global_settings entry is allowed."
     );
     eprintln!();
     eprintln!("COMMANDS:");
     eprintln!("    check <config.yaml>                            Validate configuration and exit");
     eprintln!("    version                                        Print version information");
+    #[cfg(target_os = "linux")]
+    eprintln!(
+        "    cleanup-tun                                    Recover owned managed-TUN state in this network namespace"
+    );
     eprintln!("    SIGHUP reloads configuration even with --no-reload.");
     eprintln!("    SIGINT/SIGTERM stop listeners and exit without waiting for TCP reload drains.");
     eprintln!(
@@ -54,6 +61,11 @@ fn print_usage_and_exit(arg0: String) -> ! {
     );
     eprintln!("      --auth x25519|mlkem768 (repeatable), --mode native|xorpub|random");
     eprintln!("      --rtt 0rtt|1rtt, --lifetime 600s|N-Ms|0s");
+    eprintln!(
+        "    generate-tendns-txt [options]                  Generate an encrypted tendns TXT value"
+    );
+    eprintln!("      --name OWNER, --entry LABEL:TYPE:VALUE (repeatable), --valid-for-secs N");
+    eprintln!("      Reads the discovery key from TENDNS_KEY; default validity: 86400 seconds");
     std::process::exit(1);
 }
 
@@ -111,8 +123,14 @@ fn run() -> i32 {
             }
             "--dry-run" | "-d" => dry_run = true,
             "--no-reload" => no_reload = true,
-            "--version" | "-V" => {
-                println!("shoes {}", env!("CARGO_PKG_VERSION"));
+            "-V" => {
+                println!("shoes {}", env!("SHOES_VERSION"));
+                return 0;
+            }
+            "--version" => {
+                println!("shoes {}", env!("SHOES_VERSION"));
+                println!("target: {}", env!("SHOES_TARGET"));
+                println!("compiler: {}", env!("SHOES_COMPILER"));
                 return 0;
             }
             other => {
@@ -152,6 +170,17 @@ fn run() -> i32 {
     if let Err(error) = logging::init_multi_logger(writers, directives) {
         eprintln!("Failed to initialize logger: {error}");
         return 1;
+    }
+
+    if args.first().is_some_and(|s| s == "generate-tendns-txt") {
+        match tendns_generator::generate(&args[1..]) {
+            Ok(txt) => println!("{txt}"),
+            Err(error) => {
+                eprintln!("Tendns TXT generation failed: {error:#}");
+                return 1;
+            }
+        }
+        return 0;
     }
 
     if args
@@ -306,7 +335,14 @@ fn run() -> i32 {
         .build()
         .expect("Could not build tokio runtime");
 
-    let code = match runtime.block_on(process::run(args, dry_run, no_reload)) {
+    let result = runtime.block_on(async {
+        #[cfg(target_os = "linux")]
+        if !dry_run && args.len() == 1 && args[0] == "cleanup-tun" {
+            return crate::desktop::cleanup().await;
+        }
+        process::run(args, dry_run, no_reload).await
+    });
+    let code = match result {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("shoes: {error}");

@@ -8,14 +8,14 @@ use tokio::{
 };
 
 use super::{
-    carrier::{Carrier, Reservation, Timeouts},
+    carrier::{Carrier, ReceiveGuard, Reservation, Timeouts},
     connector::Security,
     stream::{Activity, Body, Event, Memory, Reader, Stream, Tasks, UploadSignal, pipe},
     wire::{self, Path},
 };
 use crate::{
     address::NetLocation,
-    config::xhttp::{MAX_PADDING_BYTES, XhttpClientConfig, XhttpMode, XhttpVersion},
+    config::xhttp::{MAX_PADDING_BYTES, ResolvedXhttpClientConfig, XhttpMode, XhttpVersion},
     resources::Budget,
     tcp::carrier_dialer::{CarrierDialer, RouteKey},
 };
@@ -57,7 +57,8 @@ impl Drop for SlotPermit {
 struct Lease {
     carrier: Arc<Carrier>,
     reservation: Option<Reservation>,
-    _permit: SlotPermit,
+    download_permit: Option<OwnedSemaphorePermit>,
+    slot_permit: Arc<SlotPermit>,
 }
 
 #[derive(Default)]
@@ -80,7 +81,7 @@ impl Lease {
     async fn request(
         &mut self,
         client: &Client,
-        request: Request<Body>,
+        mut request: Request<Body>,
         memory: Memory,
         tasks: &Tasks,
         packet: bool,
@@ -95,7 +96,7 @@ impl Lease {
                 .await??
             }
         };
-        if self._permit.slot.as_ref().is_some_and(|slot| {
+        if self.slot_permit.slot.as_ref().is_some_and(|slot| {
             slot.active() > self.carrier.capacity(client.config.limits.request_limit())
         }) {
             return Err(crate::resources::exhausted());
@@ -108,6 +109,11 @@ impl Lease {
         } else {
             Timeouts::headers(client.header_timeout())
         };
+        if let Some(download) = self.download_permit.take() {
+            request
+                .extensions_mut()
+                .insert(ReceiveGuard::new((download, self.slot_permit.clone())));
+        }
         self.carrier
             .request_reserved(request, memory, tasks, timeouts, reservation)
             .await
@@ -115,13 +121,14 @@ impl Lease {
 }
 
 pub struct Client {
-    config: XhttpClientConfig,
+    config: ResolvedXhttpClientConfig,
     endpoint: NetLocation,
     authority: String,
     path: Path,
     version: XhttpVersion,
     mode: XhttpMode,
     security: Security,
+    masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
     memory: Arc<Budget>,
     admission: Arc<Budget>,
     tasks: Tasks,
@@ -146,7 +153,7 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     pub fn new(
-        config: XhttpClientConfig,
+        config: ResolvedXhttpClientConfig,
         endpoint: NetLocation,
         authority: String,
         version: XhttpVersion,
@@ -170,6 +177,7 @@ impl Client {
             version,
             mode,
             security,
+            masks: Vec::new(),
             slots: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -193,6 +201,11 @@ impl Client {
         });
     }
 
+    pub(super) fn with_masks(mut self, masks: Vec<Arc<crate::sudoku_mask::Prepared>>) -> Self {
+        self.masks = masks;
+        self
+    }
+
     async fn dial(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Arc<Carrier>> {
         let header_limit = 8192 + MAX_PADDING_BYTES as usize;
         tokio::time::timeout(
@@ -201,13 +214,23 @@ impl Client {
                 if self.version == XhttpVersion::H3 {
                     Carrier::quic(dialer.open_quic().await?, header_limit).await
                 } else {
+                    let mut stream = dialer.open_stream().await?;
+                    for config in &self.masks {
+                        stream = Box::new(crate::sudoku_mask::SudokuStream::new(
+                            stream,
+                            config.clone(),
+                            crate::sudoku_mask::Role::Client,
+                        ));
+                    }
+                    let stream = self
+                        .security
+                        .wrap(stream, &self.endpoint, self.version)
+                        .await?;
                     Carrier::tcp_with_windows(
-                        self.security
-                            .wrap(dialer.open_stream().await?, &self.endpoint, self.version)
-                            .await?,
+                        stream,
                         self.version,
                         header_limit,
-                        self.config.limits.h2_windows(),
+                        self.config.limits.h2_client_windows(),
                     )
                     .await
                 }
@@ -216,7 +239,11 @@ impl Client {
         .await?
     }
 
-    async fn lease(&self, dialer: &Arc<dyn CarrierDialer>, allow_dial: bool) -> io::Result<Lease> {
+    async fn lease(
+        &self,
+        dialer: &Arc<dyn CarrierDialer>,
+        receive_admission: bool,
+    ) -> io::Result<Lease> {
         let (slot, permit) = {
             let mut slots = self.slots.lock();
             let idle = Duration::from_secs(self.config.pool.idle_timeout_secs);
@@ -231,21 +258,27 @@ impl Client {
                 let Ok(Some(reservation)) = carrier.try_reserve() else {
                     continue;
                 };
+                let download_permit = if receive_admission {
+                    let Ok(permit) = carrier.admit_download() else {
+                        continue;
+                    };
+                    permit
+                } else {
+                    None
+                };
                 return Ok(Lease {
                     carrier: carrier.clone(),
                     reservation: Some(reservation),
-                    _permit: SlotPermit {
+                    download_permit,
+                    slot_permit: Arc::new(SlotPermit {
                         _permit: slot
                             .requests
                             .clone()
                             .try_acquire_owned()
                             .map_err(|_| crate::resources::exhausted())?,
                         slot: Some(slot.clone()),
-                    },
+                    }),
                 });
-            }
-            if !allow_dial {
-                return Err(crate::resources::exhausted());
             }
             if slots.len() >= self.config.pool.max_connections
                 && let Some(oldest) = slots
@@ -269,14 +302,14 @@ impl Client {
                 limit,
                 last_used: parking_lot::Mutex::new(tokio::time::Instant::now()),
             });
-            let permit = SlotPermit {
+            let permit = Arc::new(SlotPermit {
                 _permit: slot
                     .requests
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| crate::resources::exhausted())?,
                 slot: Some(slot.clone()),
-            };
+            });
             slots.push(slot.clone());
             (slot, permit)
         };
@@ -288,12 +321,18 @@ impl Client {
             let reservation = carrier
                 .try_reserve()?
                 .ok_or_else(crate::resources::exhausted)?;
+            let download_permit = if receive_admission {
+                carrier.admit_download()?
+            } else {
+                None
+            };
             // Publish only after the initializer owns its stream credit.
             assert!(slot.carrier.set(carrier.clone()).is_ok());
             Ok(Lease {
                 carrier,
                 reservation: Some(reservation),
-                _permit: permit,
+                download_permit,
+                slot_permit: permit,
             })
         }
         .await;
@@ -343,28 +382,41 @@ impl Client {
                 } else {
                     2
                 };
-                let mut lanes = Vec::new();
-                if self.version == XhttpVersion::H1 {
+                let mut lanes = if self.version == XhttpVersion::H1 {
                     let mut permit = self
                         .h1_slots
                         .clone()
                         .try_acquire_many_owned(count)
                         .map_err(|_| crate::resources::exhausted())?;
-                    for _ in 0..count {
-                        lanes.push(Lease {
-                            carrier: self.dial(&dialer).await?,
-                            reservation: None,
-                            _permit: SlotPermit {
-                                _permit: permit.split(1).unwrap(),
-                                slot: None,
-                            },
+                    futures::future::try_join_all((0..count).map(|_| {
+                        let permit = Arc::new(SlotPermit {
+                            _permit: permit.split(1).unwrap(),
+                            slot: None,
                         });
-                    }
+                        let dialer = &dialer;
+                        async move {
+                            Ok::<_, io::Error>(Lease {
+                                carrier: self.dial(dialer).await?,
+                                reservation: None,
+                                download_permit: None,
+                                slot_permit: permit,
+                            })
+                        }
+                    }))
+                    .await?
                 } else {
-                    for _ in 0..count {
-                        lanes.push(self.lease(&dialer, true).await?);
+                    let mut lanes = Vec::new();
+                    for index in 0..count {
+                        lanes.push(
+                            self.lease(
+                                &dialer,
+                                index == 0 && self.config.pool.h2_receive_admission,
+                            )
+                            .await?,
+                        );
                     }
-                }
+                    lanes
+                };
                 let download = lanes.remove(0);
                 let mut upload = lanes.pop();
                 if self.mode == XhttpMode::PacketUp {
@@ -571,6 +623,9 @@ impl Client {
                 .sc_max_each_post_bytes
                 .bounds((1_000_000, 1_000_000), false)?,
         ) as usize;
+        // With a shared byte cap, staging can consume space needed by a download before its ACK.
+        let h1_lookahead =
+            self.version == XhttpVersion::H1 && self.config.limits.session_byte_limit().is_none();
         let concurrency = if self.version == XhttpVersion::H1 {
             1
         } else {
@@ -588,8 +643,9 @@ impl Client {
         let mut sequence = 0u64;
         let mut next_post_at = tokio::time::Instant::now();
         loop {
-            while inflight.len() >= concurrency
-                || sequence - window.next >= self.config.packet_pipeline_depth as u64
+            while !h1_lookahead
+                && (inflight.len() >= concurrency
+                    || sequence - window.next >= self.config.packet_pipeline_depth as u64)
             {
                 idle_lane.get_or_insert(window.acknowledge(inflight.next().await.unwrap()?));
             }
@@ -636,18 +692,33 @@ impl Client {
                         }
                         event = match reader.receiver.try_recv() {
                             Ok(event) => Some(event),
-                            Err(_) if tokio::time::Instant::now() < next_post_at => loop {
-                                tokio::select! {
-                                    biased;
-                                    _ = tokio::time::sleep_until(next_post_at) => break None,
-                                    done = inflight.next(), if !inflight.is_empty() => {
-                                        idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
+                            Err(_)
+                                if tokio::time::Instant::now() < next_post_at
+                                    || (h1_lookahead && !inflight.is_empty()) =>
+                            {
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        done = inflight.next(), if !inflight.is_empty() => {
+                                            idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
+                                            if tokio::time::Instant::now() >= next_post_at {
+                                                break None;
+                                            }
+                                        }
+                                        _ = tokio::time::sleep_until(next_post_at),
+                                            if !h1_lookahead || inflight.is_empty() => break None,
+                                        event = reader.receiver.recv() => break event,
                                     }
-                                    event = reader.receiver.recv() => break event,
                                 }
-                            },
+                            }
                             Err(_) => None,
                         };
+                    }
+                    // H1 stages one bounded successor while its existing lane awaits the ACK.
+                    if self.version == XhttpVersion::H1 {
+                        while let Some(result) = inflight.next().await {
+                            idle_lane.get_or_insert(window.acknowledge(result?));
+                        }
                     }
                     loop {
                         tokio::select! {
@@ -725,8 +796,8 @@ impl Client {
                                 let _allocation = gate.lock().await;
                                 if lane.carrier.closed() {
                                     drop(lane);
-                                    lane = self.lease(&dialer, true).await?;
-                                } else if let Ok(replacement) = self.lease(&dialer, true).await {
+                                    lane = self.lease(&dialer, false).await?;
+                                } else if let Ok(replacement) = self.lease(&dialer, false).await {
                                     // No request has been sent; another session may own this carrier's credit.
                                     lane = replacement;
                                 }
@@ -778,7 +849,7 @@ impl Client {
     async fn packet_lane(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Lease> {
         let gate = self.route_gate(dialer.route_key());
         let _allocation = gate.lock().await;
-        self.lease(dialer, true).await
+        self.lease(dialer, false).await
     }
 }
 
@@ -789,8 +860,52 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn sudoku_mask_carriers_preserve_security_scheme_and_disabled_sni() {
+        let resolver: Arc<dyn crate::resolver::Resolver> =
+            Arc::new(crate::resolver::NativeResolver::new());
+        let xhttp = json!({"type":"xhttp","protocol":{"type":"socks"}});
+        let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+        for (protocol, secure, count) in [
+            (mask(xhttp.clone()), false, 1),
+            (mask(mask(xhttp.clone())), false, 2),
+            (mask(json!({"type":"tls","protocol":xhttp})), true, 1),
+            (mask(mask(json!({"type":"tls","protocol":xhttp}))), true, 2),
+        ] {
+            let config = crate::config::test_support::from_json(
+                json!({"address":"origin.example:443","protocol":protocol}),
+            )
+            .unwrap();
+            let (client, _) = super::super::connector::build(&config, resolver.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(client.masks.len(), count);
+            let request = client.request("session", None, false, Body::Empty).unwrap();
+            assert_eq!(
+                request.uri().scheme_str(),
+                Some(if secure { "https" } else { "http" })
+            );
+            if let Security::Tls { name, .. } = &client.security {
+                assert_eq!(name.to_str(), "origin.example");
+            }
+        }
+        let config = crate::config::test_support::from_json(
+            json!({"address":"origin.example:443","protocol":mask(json!({
+            "type":"tls","sni_hostname":null,"protocol":xhttp}))}),
+        )
+        .unwrap();
+        let (client, _) = super::super::connector::build(&config, resolver)
+            .unwrap()
+            .unwrap();
+        let Security::Tls { config, .. } = &client.security else {
+            panic!("expected TLS")
+        };
+        assert!(!config.enable_sni);
+    }
+
+    #[test]
     fn default_client_admission_is_uncapped() {
-        let config = serde_json::from_value(json!({"protocol": {"type": "socks"}})).unwrap();
+        let config =
+            crate::config::test_support::from_json(json!({"protocol": {"type": "socks"}})).unwrap();
         let client = Client::new(
             config,
             NetLocation::from_str("localhost:443", None).unwrap(),
@@ -861,7 +976,7 @@ mod tests {
                     .unwrap();
                 while let Ok(Some(_)) = driver.accept().await {}
             });
-            let config = serde_json::from_value(json!({
+            let config = crate::config::test_support::from_json(json!({
                 "pool":{"max_connections":1},"protocol":{"type":"socks"}
             }))
             .unwrap();
@@ -944,7 +1059,7 @@ mod tests {
                 opens: std::sync::atomic::AtomicUsize::new(0),
             });
             let route: Arc<dyn CarrierDialer> = dialer.clone();
-            let config = serde_json::from_value(json!({
+            let config = crate::config::test_support::from_json(json!({
                 "sc_max_each_post_bytes":1,"sc_min_posts_interval_ms":1,
                 "pool":{"max_connections":2},"protocol":{"type":"socks"}
             }))
@@ -961,7 +1076,7 @@ mod tests {
                 .unwrap(),
             );
             let download = client.lease(&route, true).await.unwrap();
-            let upload = client.lease(&route, true).await.unwrap();
+            let upload = client.lease(&route, false).await.unwrap();
             let retired = Arc::downgrade(&upload.carrier);
             let memory = Memory::new(client.memory.clone(), Some(65536));
             let (mut writer, reader) = pipe(memory.clone());
@@ -1006,7 +1121,7 @@ mod tests {
             ),
         ] {
             for (version, alpn) in [("h1", b"http/1.1".as_slice()), ("h2", b"h2")] {
-                let config = serde_json::from_value(json!({
+                let config = crate::config::test_support::from_json(json!({
                     "address":"localhost:443", "protocol":{
                         "type":"tls", "verify":false, "key_exchange_groups":groups,
                         "protocol":{"type":"xhttp", "http_version":version,

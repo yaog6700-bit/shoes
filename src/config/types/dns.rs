@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::types::rules::ClientChain;
-use crate::config::types::selection::ConfigSelection;
 use crate::dns::IpStrategy;
 use crate::option_util::NoneOrSome;
 
@@ -41,8 +40,8 @@ pub enum DnsServerSpec {
     /// Object with URL and optional client_chain, bootstrap_url, server_name, ip_strategy.
     WithOptions {
         url: String,
-        #[serde(default)]
-        client_chain: NoneOrSome<ConfigSelection<ClientChain>>,
+        #[serde(default, alias = "client_chains")]
+        client_chain: NoneOrSome<ClientChain>,
         /// Bootstrap resolver for hostname resolution.
         /// Can be a URL string (e.g., "udp://8.8.8.8") or a dns_group name.
         #[serde(default)]
@@ -105,8 +104,8 @@ impl DnsServerSpec {
     }
 
     /// Get the client_chain.
-    pub fn client_chains(&self) -> &NoneOrSome<ConfigSelection<ClientChain>> {
-        static NONE: NoneOrSome<ConfigSelection<ClientChain>> = NoneOrSome::None;
+    pub fn client_chains(&self) -> &NoneOrSome<ClientChain> {
+        static NONE: NoneOrSome<ClientChain> = NoneOrSome::None;
         if let Self::WithOptions { client_chain, .. } = self {
             client_chain
         } else {
@@ -191,6 +190,8 @@ impl DnsServerSpec {
 #[serde(deny_unknown_fields)]
 pub struct DnsConfigGroup {
     pub dns_group: String,
+    #[serde(default, skip_serializing_if = "crate::dns::StaticHosts::is_empty")]
+    pub hosts: crate::dns::StaticHosts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fake_ip: Option<crate::dns::fake_ip::FakeIpConfig>,
     #[serde(alias = "dns_server")]
@@ -198,11 +199,13 @@ pub struct DnsConfigGroup {
 }
 
 /// DNS configuration for servers.
-/// The `servers` field can be a group name, inline specs, or None (use default).
+/// The `servers` field can be a group name, inline specs, or None (underlying system resolver).
 /// After validation, `servers` is mutated to a single group name reference.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsConfig {
+    #[serde(default, skip_serializing_if = "crate::dns::StaticHosts::is_empty")]
+    pub hosts: crate::dns::StaticHosts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fake_ip: Option<crate::dns::fake_ip::FakeIpConfig>,
     #[serde(default, alias = "server")]
@@ -234,7 +237,7 @@ pub struct ExpandedDnsSpec {
     pub url: String,
     pub server_name: Option<String>,
     /// Client chains with all group refs resolved to configs.
-    pub client_chains: Vec<ClientChain>,
+    pub client_chains: Vec<crate::config::resolved::ResolvedClientChain>,
     /// Bootstrap resolver URL or group name. Groups are resolved at runtime.
     pub bootstrap_url: Option<String>,
     pub ip_strategy: IpStrategy,
@@ -252,6 +255,7 @@ pub struct ExpandedDnsSpec {
 #[derive(Debug, Clone)]
 pub struct ExpandedDnsGroup {
     pub name: String,
+    pub hosts: crate::dns::StaticHosts,
     pub specs: Vec<ExpandedDnsSpec>,
     pub fake_ip: Option<crate::dns::fake_ip::FakeIpOptions>,
     pub use_default_resolver: bool,
@@ -431,6 +435,7 @@ servers: my-dns-group
     fn test_dns_config_resolved_group() {
         // After validation, servers should be a single group name
         let config = DnsConfig {
+            hosts: Default::default(),
             fake_ip: None,
             servers: NoneOrSome::One(DnsServerSpec::Simple("my-resolved-group".to_string())),
         };

@@ -15,13 +15,166 @@ use crate::xudp::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwor
 use crate::xudp::message_stream::MAX_XUDP_ROUTES;
 
 #[tokio::test]
+async fn protocol_blocks_are_not_destination_cached_and_active_flows_stay_pinned() {
+    use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+    use crate::rules::{Compiler, Expression};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for (allow_stun, session) in [(true, false), (false, false), (true, true), (false, true)] {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+            let expression = Expression::from_config(serde_json::json!({"protocol": "stun"}))
+                .unwrap()
+                .inverted(!allow_stun);
+            let selector = Arc::new(ClientProxySelector::with_options(
+                vec![ConnectRule::compiled(
+                    Compiler::default().compile(expression).unwrap(),
+                    false,
+                    ConnectAction::new_allow(
+                        Some(NetLocation::from_ip_addr(
+                            "127.0.0.1".parse().unwrap(),
+                            socket.local_addr().unwrap().port(),
+                        )),
+                        crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
+                    ),
+                )],
+                true,
+            ));
+            let source = PacketSource::default();
+            let mut server = if session {
+                ServerStream::Session(Box::new(source.clone()))
+            } else {
+                ServerStream::Targeted(Box::new(source.clone()))
+            };
+            let mut router = UdpRouter::new(&mut server, selector, resolver, false);
+            let destination = NetLocation::from_str("192.0.2.1:443", None).unwrap();
+            let stun = crate::sniff::udp::tests::stun_packet();
+            let ordinary = b"ordinary".to_vec();
+            let (allowed, blocked) = if allow_stun {
+                (&stun, &ordinary)
+            } else {
+                (&ordinary, &stun)
+            };
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            router.start_session_creation(
+                &mut cx,
+                InboundPacket {
+                    destination: destination.clone(),
+                    session_id: 1,
+                },
+                blocked,
+            );
+            assert!(router.pending_creates.is_empty());
+            assert!(router.sessions.is_empty());
+            assert!(router.blocked.is_empty());
+            router.blocked.put(destination.clone(), ());
+            router.start_session_creation(
+                &mut cx,
+                InboundPacket {
+                    destination: destination.clone(),
+                    session_id: 1,
+                },
+                allowed,
+            );
+            futures::future::poll_fn(|cx| {
+                router.poll_pending_creates(cx);
+                if router.pending_creates.is_empty() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert_eq!(router.sessions.len(), 1);
+            source
+                .packets
+                .lock()
+                .unwrap()
+                .push_back((destination, blocked.clone()));
+            futures::future::poll_fn(|cx| {
+                router.poll_outbound(cx, false);
+                if router.remote_write_queue.is_empty() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            let mut first_peer = None;
+            for expected in [allowed, blocked] {
+                let mut bytes = [0; 4096];
+                let (len, peer) = socket.recv_from(&mut bytes).await.unwrap();
+                assert_eq!(&bytes[..len], expected);
+                assert_eq!(*first_peer.get_or_insert(peer), peer);
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn oversized_xudp_packets_do_not_disable_the_router_destination() {
+    use tokio::io::AsyncReadExt;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let destination = NetLocation::from_str("127.0.0.1:443", None).unwrap();
+        let source = PacketSource::default();
+        let mut server = ServerStream::Targeted(Box::new(source.clone()));
+        let mut router = test_router(&mut server);
+        let (stream, mut peer) = tokio::io::duplex(16384);
+        router.sessions.insert(
+            0,
+            RoutingSession::new(
+                destination.clone(),
+                0,
+                destination.clone(),
+                LookupKey::Destination(destination.clone()),
+                Box::new(crate::xudp::client_stream::XudpClientStream::new(
+                    Box::new(stream),
+                    destination.clone(),
+                )),
+            ),
+        );
+        let SessionLookup::ByDestination(lookup) = &mut router.session_lookup else {
+            unreachable!()
+        };
+        lookup.insert(destination.clone(), KeyState::Active(0));
+        for (size, status) in [(7526, SessionStatus::New), (5, SessionStatus::Keep)] {
+            source.packets.lock().unwrap().extend([
+                (destination.clone(), vec![0; 7527]),
+                (destination.clone(), vec![42; size]),
+            ]);
+            router.poll_outbound(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                false,
+            );
+            assert!(!router.sessions.get(&0).unwrap().remote_write_eof);
+            let metadata_len = peer.read_u16().await.unwrap();
+            let mut wire = BytesMut::new();
+            wire.put_u16(metadata_len);
+            wire.resize(2 + metadata_len as usize + 2 + size, 0);
+            peer.read_exact(&mut wire[2..]).await.unwrap();
+            let (metadata, payload) = crate::xudp::frame::decode_frame(&mut wire)
+                .unwrap()
+                .unwrap();
+            assert_eq!(metadata.status, status);
+            assert_eq!(payload, vec![42; size]);
+            assert!(wire.is_empty());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn fake_unknown_and_blocked_routes_recover_without_poisoning_wire_cache() {
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
-    use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
+    use crate::dns::DnsContext;
+    use crate::dns::fake_ip::FakeIpOptions;
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let context = Arc::new(
-        FakeDnsContext::new(
+        DnsContext::new(
             FakeIpOptions {
                 ipv4_range: Some("198.18.0.0/29".into()),
                 max_entries: 1,

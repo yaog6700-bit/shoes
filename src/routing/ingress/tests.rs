@@ -1,12 +1,72 @@
 use super::*;
 use crate::address::NetLocationMask;
 use crate::client_proxy_selector::{ConnectAction, ConnectRule};
-use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
+use crate::dns::DnsContext;
+use crate::dns::fake_ip::FakeIpOptions;
 use crate::resolver::{DnsExchangeFuture, ResolveFuture};
+use crate::rules::{Compiler, Expression, Network, Protocol};
 use hickory_resolver::proto::op::{Message, Query, ResponseCode};
 use hickory_resolver::proto::rr::{Name, RecordType};
 use std::pin::Pin;
 use tokio::io::ReadBuf;
+
+#[derive(Debug)]
+struct FailedUdpConnector(io::ErrorKind);
+
+#[async_trait::async_trait]
+impl crate::tcp::socket_connector::SocketConnector for FailedUdpConnector {
+    async fn connect(
+        &self,
+        _: &Arc<dyn Resolver>,
+        _: &crate::address::ResolvedLocation,
+    ) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+        unreachable!()
+    }
+
+    async fn connect_udp_bidirectional(
+        &self,
+        _: &Arc<dyn Resolver>,
+        _: crate::address::ResolvedLocation,
+    ) -> io::Result<Box<dyn AsyncMessageStream>> {
+        Err(io::Error::new(self.0, "test UDP dial failure"))
+    }
+
+    fn bind_interface(&self) -> Option<&str> {
+        None
+    }
+}
+
+pub(crate) fn protocol_failure_selector(blocked: bool) -> Arc<ClientProxySelector> {
+    udp_failure_selector(
+        Expression::Protocol(vec![if blocked {
+            Protocol::Dtls
+        } else {
+            Protocol::Stun
+        }]),
+        io::ErrorKind::PermissionDenied,
+    )
+}
+
+pub(crate) fn udp_failure_selector(
+    condition: Expression,
+    dial_error: io::ErrorKind,
+) -> Arc<ClientProxySelector> {
+    use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
+    let predicate = Compiler::default().compile(condition).unwrap();
+    Arc::new(ClientProxySelector::new(vec![ConnectRule::compiled(
+        predicate,
+        false,
+        ConnectAction::new_allow(
+            None,
+            ClientChainGroup::new(vec![ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Arc::new(FailedUdpConnector(
+                    dial_error,
+                )))],
+                vec![],
+            )]),
+        ),
+    )]))
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum PacketMode {
@@ -19,7 +79,7 @@ impl PacketMode {
     fn address(self, target: &NetLocation) -> Vec<u8> {
         match self {
             Self::Fixed => Vec::new(),
-            Self::Socks => crate::socks_handler::write_location_to_vec(target),
+            Self::Socks => crate::socks_handler::write_location_to_vec(target).unwrap(),
             Self::Uot => {
                 let mut bytes = vec![0; 260];
                 let len = crate::uot::uot_common::write_uot_address(&mut bytes, target).unwrap();
@@ -61,6 +121,23 @@ pub(crate) enum UdpCase {
     Dns,
     Tls,
     Http,
+    Stun,
+    Dtls,
+    StunHostname,
+}
+
+impl UdpCase {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Dns,
+        Self::Tls,
+        Self::Http,
+        Self::Stun,
+        Self::Dtls,
+        Self::StunHostname,
+    ];
+    pub(crate) fn classified(self) -> bool {
+        matches!(self, Self::Stun | Self::Dtls | Self::StunHostname)
+    }
 }
 
 pub(crate) struct UdpFixture {
@@ -75,11 +152,13 @@ impl UdpFixture {
     pub(crate) async fn new(case: UdpCase, tasks: &mut tokio::task::JoinSet<()>) -> Self {
         let dns = case == UdpCase::Dns;
         let resolver: Arc<dyn Resolver> = Arc::new(RealDns);
-        let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+        let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let payload = match case {
             UdpCase::Dns => query(RecordType::A),
             UdpCase::Tls => crate::sniff::tests::hello(&rustls::version::TLS13, true),
             UdpCase::Http => crate::sniff::tests::http_request(),
+            UdpCase::Stun | UdpCase::StunHostname => crate::sniff::udp::tests::stun_packet(),
+            UdpCase::Dtls => crate::sniff::udp::tests::dtls_packet(),
         };
         let mut rules = Vec::new();
         let target = if dns {
@@ -98,14 +177,34 @@ impl UdpFixture {
                 assert_eq!(&bytes[..len], expected);
                 socket.send_to(&bytes[..len], peer).await.unwrap();
             });
-            rules.push(ConnectRule::new(
-                vec![NetLocationMask::from("restored.example").unwrap()],
+            let mut conditions = vec![
+                Expression::Domain(vec!["restored.example".into()]),
+                Expression::Network(vec![Network::Udp]),
+            ];
+            if case.classified() {
+                let protocol = if case == UdpCase::Dtls {
+                    Protocol::Dtls
+                } else {
+                    Protocol::Stun
+                };
+                conditions.push(Expression::Protocol(vec![protocol]));
+            }
+            let predicate = Compiler::default()
+                .compile(Expression::All(conditions))
+                .unwrap();
+            rules.push(ConnectRule::compiled(
+                predicate,
+                false,
                 ConnectAction::new_allow(
                     Some(destination),
                     crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
                 ),
             ));
-            NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
+            if case == UdpCase::StunHostname {
+                NetLocation::from_str("restored.example:443", None).unwrap()
+            } else {
+                NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
+            }
         };
         // The same TLS or HTTP bytes over TCP would select this block.
         rules.insert(
@@ -117,7 +216,7 @@ impl UdpFixture {
         );
         let selector = Arc::new(
             ClientProxySelector::new(rules)
-                .with_sniff(true)
+                .with_sniff(!case.classified())
                 .with_fake_dns_context(Some(context))
                 .unwrap(),
         );
@@ -141,7 +240,7 @@ impl UdpFixture {
 
     pub(crate) fn uot_header(&self, fixed: bool) -> Vec<u8> {
         let mut bytes = vec![u8::from(fixed)];
-        bytes.extend(crate::socks_handler::write_location_to_vec(&self.target));
+        bytes.extend(crate::socks_handler::write_location_to_vec(&self.target).unwrap());
         bytes
     }
 
@@ -245,7 +344,7 @@ async fn exchange(stream: &mut Box<dyn AsyncMessageStream>, request: &[u8]) -> M
 #[tokio::test]
 async fn local_dns_precedes_blocks_restoration_and_hostname_resolution() {
     let real: Arc<dyn Resolver> = Arc::new(RealDns);
-    let context = Arc::new(FakeDnsContext::new(Default::default(), real.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(Default::default(), real.clone()).unwrap());
     let selector = ClientProxySelector::new(Vec::new())
         .with_fake_dns_context(Some(context))
         .unwrap();
@@ -286,6 +385,144 @@ async fn local_dns_precedes_blocks_restoration_and_hostname_resolution() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn local_dns_with_protocol_rules_does_not_wait_for_a_datagram() {
+    let resolver: Arc<dyn Resolver> = Arc::new(RealDns);
+    let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
+    let predicate = Compiler::default()
+        .compile(Expression::Not(Box::new(Expression::Protocol(vec![
+            Protocol::Stun,
+        ]))))
+        .unwrap();
+    let selector = ClientProxySelector::new(vec![ConnectRule::compiled(
+        predicate,
+        false,
+        ConnectAction::Block,
+    )])
+    .with_fake_dns_context(Some(context))
+    .unwrap();
+    assert!(selector.has_protocol_rules());
+    let target = NetLocation::from_str("198.18.0.1:53", None).unwrap();
+    let prepared = PreparedUdp::new(&selector, target.clone()).unwrap();
+    assert!(!prepared.needs_sniff(&selector));
+    let (_peer, inbound) = tokio::io::duplex(1024);
+    let mut inbound = PeekMessageStream::new(crate::vless::VlessMessageStream::new(inbound));
+    let started = tokio::time::Instant::now();
+    let mut setup = prepared
+        .route(&mut inbound, &selector, &resolver)
+        .await
+        .unwrap()
+        .connect(&resolver)
+        .await
+        .unwrap();
+    assert_eq!(tokio::time::Instant::now(), started);
+    assert_eq!(setup.reply_identity, target);
+    let response = exchange(&mut setup.stream, &query(RecordType::A)).await;
+    assert_eq!(response.metadata.id, 42);
+    assert_eq!(response.answers.len(), 1);
+}
+
+#[tokio::test]
+async fn classified_udp_reaches_flow_metadata_and_notes() {
+    use crate::control::catalog::RuleDescription;
+    use crate::control::flows::{FlowContext, FlowRegistry};
+    use tokio::io::AsyncWriteExt;
+    let resolver: Arc<dyn Resolver> = Arc::new(RealDns);
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let destination = NetLocation::from_ip_addr(
+        "127.0.0.1".parse().unwrap(),
+        socket.local_addr().unwrap().port(),
+    );
+    let original = NetLocation::from_str("192.0.2.1:443", None).unwrap();
+    for fixed in [false, true] {
+        for (enabled, packet, label, expected_notes) in [
+            (
+                true,
+                crate::sniff::udp::tests::stun_packet(),
+                "stun",
+                vec!["UDP protocol stun"],
+            ),
+            (
+                true,
+                crate::sniff::udp::tests::dtls_packet(),
+                "dtls",
+                vec!["UDP protocol dtls"],
+            ),
+            (true, b"unknown".to_vec(), "", vec!["UDP protocol unknown"]),
+            (false, crate::sniff::udp::tests::stun_packet(), "", vec![]),
+        ] {
+            let registry = Arc::new(FlowRegistry::new(true));
+            let group = crate::tcp::chain_builder::build_direct_chain_group(resolver.clone())
+                .with_description(Some(Arc::new(RuleDescription {
+                    payload: "traffic".into(),
+                    proxy: "DIRECT".into(),
+                    context: Some(Arc::new(FlowContext {
+                        registry: registry.clone(),
+                        generation: 1,
+                        inbound: "test".into(),
+                        scope: "root".into(),
+                        protocol: "Socks5".into(),
+                    })),
+                })));
+            let condition = if enabled {
+                Expression::Any(vec![
+                    Expression::Protocol(vec![Protocol::Stun, Protocol::Dtls]),
+                    Expression::Network(vec![Network::Udp]),
+                ])
+            } else {
+                Expression::Network(vec![Network::Udp])
+            };
+            let selector = ClientProxySelector::new(vec![ConnectRule::compiled(
+                Compiler::default().compile(condition).unwrap(),
+                false,
+                ConnectAction::new_allow(Some(destination.clone()), group),
+            )]);
+            let stream = if fixed {
+                let (mut peer, inbound) = tokio::io::duplex(1024);
+                peer.write_all(&PacketMode::Fixed.packet(&original, &packet))
+                    .await
+                    .unwrap();
+                let mut inbound =
+                    PeekMessageStream::new(crate::vless::VlessMessageStream::new(inbound));
+                PreparedUdp::new(&selector, original.clone())
+                    .unwrap()
+                    .route(&mut inbound, &selector, &resolver)
+                    .await
+                    .unwrap()
+                    .connect(&resolver)
+                    .await
+                    .unwrap()
+                    .stream
+            } else {
+                connect_udp_packet(&selector, original.clone(), &resolver, None, &packet)
+                    .await
+                    .unwrap()
+            };
+            let flow = stream.flow().unwrap();
+            assert_eq!(flow.metadata.network, "udp");
+            assert_eq!(flow.metadata.protocol, "Socks5");
+            assert_eq!(flow.metadata.sniff_protocol, label);
+            assert_eq!(
+                flow.metadata.shoes_original_destination,
+                original.to_string()
+            );
+            assert_eq!(flow.metadata.remote_destination, destination.to_string());
+            let snapshot = serde_json::to_value(flow.notes.as_ref().unwrap().snapshot()).unwrap();
+            let protocol_notes: Vec<_> = snapshot
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|note| note["text"].as_str())
+                .filter(|text| text.starts_with("UDP protocol "))
+                .collect();
+            assert_eq!(protocol_notes, expected_notes);
+            assert_eq!(registry.snapshot(0).connections.len(), 1);
+            drop(stream);
+            assert!(registry.snapshot(0).connections.is_empty());
+        }
+    }
+}
+
 #[tokio::test]
 async fn snell_dns_hostname_replies_are_resolved_before_ip_only_framing() {
     use crate::async_stream::{
@@ -305,7 +542,7 @@ async fn snell_dns_hostname_replies_are_resolved_before_ip_only_framing() {
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let resolver: Arc<dyn Resolver> = Arc::new(DnsAddress);
-        let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+        let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let selector = Arc::new(
             ClientProxySelector::new(vec![])
                 .with_fake_dns_context(Some(context))
@@ -354,7 +591,7 @@ async fn snell_dns_hostname_replies_are_resolved_before_ip_only_framing() {
 #[tokio::test]
 async fn legacy_replies_preserve_domain_encoded_fake_ips_without_resolution() {
     let real: Arc<dyn Resolver> = Arc::new(RealDns);
-    let context = Arc::new(FakeDnsContext::new(Default::default(), real.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(Default::default(), real.clone()).unwrap());
     let selector = ClientProxySelector::new(vec![ConnectRule::new(
         vec![NetLocationMask::from("encoded.example").unwrap()],
         ConnectAction::new_allow(
@@ -401,7 +638,7 @@ async fn legacy_replies_preserve_domain_encoded_fake_ips_without_resolution() {
 async fn restored_target_is_frozen_and_override_to_53_does_not_reintercept() {
     let real: Arc<dyn Resolver> = Arc::new(RealDns);
     let context = Arc::new(
-        FakeDnsContext::new(
+        DnsContext::new(
             FakeIpOptions {
                 max_entries: 1,
                 ..Default::default()

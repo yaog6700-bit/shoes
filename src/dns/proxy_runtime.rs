@@ -24,7 +24,7 @@ const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 pub struct ProxyRuntimeProvider {
     chain_group: Arc<ClientChainGroup>,
     /// Resolver for proxy server hostnames (not the DNS queries themselves).
-    /// Uses NativeResolver since we can't use the DNS server we're trying to reach.
+    /// Uses the explicit bootstrap route, or native DNS when none was configured.
     bootstrap_resolver: Arc<dyn Resolver>,
     /// QUIC socket binder that selects from the same direct-only chain.
     quic_binder: ProxyQuicBinder,
@@ -155,7 +155,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         let chain_group = self.chain_group.clone();
 
         Box::pin(async move {
-            let bind_interface = chain_group.select_bind_interface()?.map(str::to_owned);
+            let bind_interface = chain_group.select_bind_interface()?;
             let socket = crate::socket_util::new_outbound_socket2_udp_socket(
                 local_addr.is_ipv6(),
                 bind_interface,
@@ -190,7 +190,7 @@ impl QuicSocketBinder for ProxyQuicBinder {
             .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
         let socket = crate::socket_util::new_outbound_socket2_udp_socket(
             local_addr.is_ipv6(),
-            self.chain_group.select_bind_interface()?.map(str::to_owned),
+            self.chain_group.select_bind_interface()?,
             Some(local_addr),
         )?;
         crate::socket_util::set_udp_socket_buffers(

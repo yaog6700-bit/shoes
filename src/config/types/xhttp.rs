@@ -3,6 +3,7 @@ use std::{
     io,
 };
 
+pub use crate::config::resolved::{ResolvedXhttpClientConfig, ResolvedXhttpServerConfig};
 use serde::{Deserialize, Serialize};
 
 use super::{ClientProxyConfig, GlobalLimits, ServerProxyConfig};
@@ -157,7 +158,8 @@ pub struct XhttpLimits {
     pub max_requests_per_session: Option<usize>,
     pub max_requests: Option<usize>,
     pub h2_stream_window_bytes: usize,
-    pub h2_connection_window_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub h2_connection_window_bytes: Option<usize>,
     pub setup_timeout_secs: u64,
     pub packet_timeout_secs: u64,
     pub response_header_timeout_secs: u64,
@@ -174,7 +176,7 @@ impl Default for XhttpLimits {
             max_requests_per_session: None,
             max_requests: None,
             h2_stream_window_bytes: 4 * 1024 * 1024,
-            h2_connection_window_bytes: 8 * 1024 * 1024,
+            h2_connection_window_bytes: None,
             setup_timeout_secs: 60,
             packet_timeout_secs: 300,
             response_header_timeout_secs: 60,
@@ -197,6 +199,15 @@ impl XhttpLimits {
     }
 
     pub(crate) fn h2_windows(&self) -> (u32, u32) {
+        self.h2_windows_with_default(8 * 1024 * 1024)
+    }
+
+    pub(crate) fn h2_client_windows(&self) -> (u32, u32) {
+        let (stream, connection) = self.h2_windows_with_default(64 * 1024 * 1024);
+        (stream.min(connection), connection)
+    }
+
+    fn h2_windows_with_default(&self, connection_default: usize) -> (u32, u32) {
         let stream_window = self
             .h2_stream_window_bytes
             .min(self.session_byte_limit().unwrap_or(usize::MAX))
@@ -204,6 +215,7 @@ impl XhttpLimits {
         // HTTP/2 starts every connection with at least 65535 bytes of credit.
         let connection_window = self
             .h2_connection_window_bytes
+            .unwrap_or(connection_default)
             .min(self.max_buffered_bytes.unwrap_or(usize::MAX))
             .max(65535) as u32;
         (stream_window, connection_window)
@@ -244,7 +256,6 @@ impl XhttpLimits {
         if [
             self.max_requests_per_connection,
             self.h2_stream_window_bytes,
-            self.h2_connection_window_bytes,
         ]
         .contains(&0)
             || [
@@ -256,8 +267,9 @@ impl XhttpLimits {
             || self.max_requests_per_connection > u32::MAX as usize
             || self.max_requests_per_connection > tokio::sync::Semaphore::MAX_PERMITS
             || self.h2_stream_window_bytes > i32::MAX as usize
-            || self.h2_connection_window_bytes > i32::MAX as usize
-            || self.h2_connection_window_bytes < 65535
+            || self
+                .h2_connection_window_bytes
+                .is_some_and(|window| !(65535..=i32::MAX as usize).contains(&window))
         {
             return Err(invalid(
                 "XHTTP limits must be positive and request count must fit u32",
@@ -273,6 +285,7 @@ pub struct XhttpPool {
     pub max_connections: usize,
     pub max_h1_connections: usize,
     pub idle_timeout_secs: u64,
+    pub h2_receive_admission: bool,
 }
 
 impl Default for XhttpPool {
@@ -281,13 +294,14 @@ impl Default for XhttpPool {
             max_connections: 3,
             max_h1_connections: 64,
             idle_timeout_secs: 60,
+            h2_receive_admission: false,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct XhttpClientConfig {
+pub struct XhttpClientRecord<P> {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -314,8 +328,10 @@ pub struct XhttpClientConfig {
     pub limits: XhttpLimits,
     #[serde(default)]
     pub pool: XhttpPool,
-    pub protocol: Box<ClientProxyConfig>,
+    pub protocol: Box<P>,
 }
+
+pub type XhttpClientConfig = XhttpClientRecord<ClientProxyConfig>;
 
 fn default_download_idle_timeout_secs() -> u64 {
     15 * 60
@@ -325,8 +341,8 @@ fn default_packet_pipeline_depth() -> usize {
     30
 }
 
-impl XhttpClientConfig {
-    pub fn validate(&self) -> io::Result<()> {
+impl<P> XhttpClientRecord<P> {
+    fn validate_settings(&self, inner_direct: bool) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
         self.limits.validate()?;
         if self.download_idle_timeout_secs == 0 {
@@ -352,7 +368,7 @@ impl XhttpClientConfig {
                 "XHTTP packet size and pool limits must be positive",
             ));
         }
-        if self.protocol.is_direct() {
+        if inner_direct {
             return Err(invalid("direct cannot be an XHTTP inner protocol"));
         }
         validate_header_names("headers", self.headers.keys())?;
@@ -363,7 +379,7 @@ impl XhttpClientConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct XhttpServerConfig {
+pub struct XhttpServerRecord<P> {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -388,18 +404,20 @@ pub struct XhttpServerConfig {
     pub no_sse_header: bool,
     #[serde(default)]
     pub limits: XhttpLimits,
-    pub protocol: Box<ServerProxyConfig>,
+    pub protocol: Box<P>,
 }
 
-impl XhttpServerConfig {
-    pub fn validate(&self) -> io::Result<()> {
+pub type XhttpServerConfig = XhttpServerRecord<ServerProxyConfig>;
+
+impl<P> XhttpServerRecord<P> {
+    fn validate_settings(&self, nested_xhttp: bool) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
         validate_header_names("matching_headers", self.matching_headers.keys())?;
         validate_header_values(
             "matching_headers",
             self.matching_headers.values().flat_map(OneOrSome::iter),
         )?;
-        if contains_server(&self.protocol) {
+        if nested_xhttp {
             return Err(invalid("nested XHTTP is not supported"));
         }
         self.limits.validate()?;
@@ -485,8 +503,65 @@ impl XhttpServerConfig {
     }
 }
 
+impl XhttpClientConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_settings(self.protocol.is_direct())
+    }
+}
+impl ResolvedXhttpClientConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_settings(self.protocol.is_direct())
+    }
+}
+impl XhttpServerConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_settings(contains_server(&self.protocol))
+    }
+}
+impl ResolvedXhttpServerConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_settings(contains_resolved_server(&self.protocol))
+    }
+}
+
+pub(crate) fn contains_resolved_server(
+    protocol: &crate::config::ResolvedServerProxyConfig,
+) -> bool {
+    match protocol {
+        crate::config::ResolvedServerProxyConfig::SudokuMask(config) => {
+            contains_resolved_server(&config.protocol)
+        }
+        crate::config::ResolvedServerProxyConfig::Xhttp(_) => true,
+        crate::config::ResolvedServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => {
+            tls_targets
+                .values()
+                .any(|t| contains_resolved_server(&t.protocol))
+                || default_tls_target
+                    .as_ref()
+                    .is_some_and(|t| contains_resolved_server(&t.protocol))
+                || shadowtls_targets
+                    .values()
+                    .any(|t| contains_resolved_server(&t.protocol))
+                || reality_targets
+                    .values()
+                    .any(|t| contains_resolved_server(&t.protocol))
+        }
+        crate::config::ResolvedServerProxyConfig::Websocket { targets } => targets
+            .iter()
+            .any(|t| contains_resolved_server(&t.protocol)),
+        _ => false,
+    }
+}
+
 pub(crate) fn contains_server(protocol: &ServerProxyConfig) -> bool {
     match protocol {
+        ServerProxyConfig::SudokuMask(config) => contains_server(&config.protocol),
         ServerProxyConfig::Xhttp(_) => true,
         ServerProxyConfig::Tls {
             tls_targets,
@@ -517,7 +592,11 @@ pub(crate) fn validate_server_transport(
     protocol: &ServerProxyConfig,
     transport: &super::Transport,
 ) -> io::Result<()> {
+    crate::sudoku_mask::validate_server(protocol, transport)?;
     match protocol {
+        ServerProxyConfig::SudokuMask(config) => {
+            validate_server_transport(&config.protocol, transport)?
+        }
         ServerProxyConfig::Xhttp(config) => {
             let quic = *transport == super::Transport::Quic;
             if (quic && !matches!(config.http_version, XhttpVersion::Auto | XhttpVersion::H3))
@@ -538,13 +617,7 @@ pub(crate) fn validate_server_transport(
             if *transport == super::Transport::Quic && contains_server(protocol) {
                 return Err(invalid("QUIC XHTTP must be a top-level protocol"));
             }
-            for target in tls_targets.values() {
-                if let ServerProxyConfig::Xhttp(config) = &target.protocol {
-                    config.tls_alpn(&target.alpn_protocols)?;
-                }
-                validate_server_transport(&target.protocol, transport)?;
-            }
-            if let Some(target) = default_tls_target {
+            for target in tls_targets.values().chain(default_tls_target.as_deref()) {
                 if let ServerProxyConfig::Xhttp(config) = &target.protocol {
                     config.tls_alpn(&target.alpn_protocols)?;
                 }
@@ -885,9 +958,14 @@ mod tests {
     fn h2_windows_follow_byte_limits_and_protocol_bounds() {
         let mut limits = XhttpLimits::default();
         assert_eq!(limits.h2_windows(), (4 * 1024 * 1024, 8 * 1024 * 1024));
+        assert_eq!(
+            limits.h2_client_windows(),
+            (4 * 1024 * 1024, 64 * 1024 * 1024)
+        );
         limits.max_session_buffered_bytes = Some(16384);
         limits.max_buffered_bytes = Some(32768);
         assert_eq!(limits.h2_windows(), (16384, 65535));
+        assert_eq!(limits.h2_client_windows(), (16384, 65535));
         limits.h2_stream_window_bytes = 8192;
         assert_eq!(limits.h2_windows().0, 8192);
         limits.h2_stream_window_bytes = 4 * 1024 * 1024;
@@ -896,8 +974,33 @@ mod tests {
         limits.max_session_buffered_bytes = Some(16384);
         limits.max_buffered_bytes = None;
         assert_eq!(limits.h2_windows(), (16384, 8 * 1024 * 1024));
-        limits.h2_connection_window_bytes = i32::MAX as usize + 1;
+        limits.h2_connection_window_bytes = Some(i32::MAX as usize + 1);
         assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn h2_client_windows_preserve_explicit_limits_and_round_trip_defaults() {
+        assert!(!XhttpPool::default().h2_receive_admission);
+        let pool: XhttpPool = serde_json::from_value(serde_json::json!({
+            "h2_receive_admission": true
+        }))
+        .unwrap();
+        assert!(pool.h2_receive_admission);
+        for window in [None, Some(65535), Some(8 * 1024 * 1024)] {
+            let limits = XhttpLimits {
+                h2_connection_window_bytes: window,
+                ..Default::default()
+            };
+            limits.validate().unwrap();
+            let serialized = serde_json::to_value(&limits).unwrap();
+            let restored: XhttpLimits = serde_json::from_value(serialized).unwrap();
+            assert_eq!(restored.h2_connection_window_bytes, window);
+            assert_eq!(restored.h2_client_windows(), limits.h2_client_windows());
+            if let Some(window) = window {
+                assert_eq!(limits.h2_client_windows().1, window as u32);
+                assert!(limits.h2_client_windows().0 <= window as u32);
+            }
+        }
     }
 
     #[test]

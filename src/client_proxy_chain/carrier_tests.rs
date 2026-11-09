@@ -14,20 +14,22 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
 - client_group: inner
   type: url-test
   url: http://inner.invalid/
-  client_proxies:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {{type: http}}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
+  client_chains:
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {{type: http}}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
 - client_group: manual
   type: selector
-  client_proxies: [inner, direct]
+  client_chains: [{{chain: [inner]}}, {{chain: [direct]}}]
 - client_group: outer
   type: url-test
   url: http://outer.invalid/
-  client_proxies: [manual, direct]
+  client_chains: [{{chain: [manual]}}, {{chain: [direct]}}]
 - address: 127.0.0.1:1080
   protocol: {{type: socks}}
   rules: [{{mask: 0.0.0.0/0, action: allow, client_chain: {route}}}]
@@ -37,13 +39,12 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
             crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
         assert!(validated.control.listeners.is_empty());
         let catalog = validated.catalog.take().unwrap();
-        let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+        let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
             panic!()
         };
-        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-            panic!()
-        };
-        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+        let rule = server.rules.into_vec().remove(0);
+        let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action
+        else {
             panic!()
         };
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
@@ -84,13 +85,13 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
             };
             json!({
                 "client_group": format!("deep-{index}"),
-                "client_proxies": [member]
+                "client_chains": [member]
             })
         })
         .collect();
     configs.push(json!({
         "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
-        "client_proxies":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
+        "client_chains":[{"chain": ["deep-0"]}, {"chain": [{"name":"other", "protocol":{"type":"direct"}}]}]
     }));
     configs.push(json!({
         "address":"127.0.0.1:1080", "protocol":{"type":"socks"},
@@ -100,13 +101,11 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
         crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
             .unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
@@ -128,37 +127,108 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
 }
 
 #[test]
-fn unselected_large_pools_keep_constant_time_round_robin() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let chain = ClientProxyChain::new(
-        (0..10_000)
-            .map(|index| InitialHopEntry::Direct(Arc::new(Socket(index, events.clone()))))
-            .collect(),
-        Vec::new(),
-    );
-    assert!(chain.selection.is_none());
-    for index in 0..20_000 {
-        assert_eq!(chain.select_indices(false).unwrap(), [index % 10_000]);
-        assert_eq!(chain.select_indices(true).unwrap(), [index % 10_000]);
+fn nonterminal_url_test_udp_selection_survives_dashboard_reads() {
+    use serde_json::json;
+
+    let mut validated = crate::config::create_server_configs(
+        serde_json::from_value(json!([
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
+             "tolerance":50, "client_chains":[
+                {"chain":[{"name":"http", "address":"127.0.0.1:8000", "protocol":{"type":"http"}}]},
+                {"chain":[{"name":"udp", "address":"127.0.0.1:8001", "protocol":{
+                    "type":"vless", "user_id":"550e8400-e29b-41d4-a716-446655440000"}}]}
+             ]},
+            {"address":"127.0.0.1:1080", "protocol":{"type":"socks"}, "rules":[
+                {"mask":"0.0.0.0/0", "action":"allow", "client_chain":["auto",
+                    {"address":"127.0.0.1:8002", "protocol":{
+                        "type":"vless", "user_id":"550e8400-e29b-41d4-a716-446655440000"}}
+                ]}
+            ]}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let catalog = validated.catalog.take().unwrap();
+    catalog
+        .selection
+        .automatic
+        .record("http", "http://probe.invalid/", Some(100));
+    catalog
+        .selection
+        .automatic
+        .record("udp", "http://probe.invalid/", Some(140));
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
+        panic!()
+    };
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } =
+        server.rules.into_vec().remove(0).action
+    else {
+        panic!()
+    };
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let group =
+        crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver.clone())
+            .unwrap();
+    let generation = crate::control::runtime::Generation {
+        id: 1,
+        leaf_udp_support: crate::clash_api::dto::leaf_udp_support(&catalog).unwrap(),
+        catalog,
+        rules: Vec::new(),
+        probes: crate::clash_api::probes::ProbeState::new(resolver, Vec::new()),
+    };
+    let chain = &group.chains[0];
+    assert_eq!(chain.select_indices(true).unwrap(), [0, 0]);
+    for _ in 0..2 {
+        let nodes = crate::clash_api::dto::proxies(&generation);
+        assert_eq!(nodes["proxies"]["auto"]["now"], "http");
+        assert_eq!(nodes["proxies"]["auto"]["udpNow"], "udp");
+        assert_eq!(chain.select_indices(true).unwrap(), [0, 0]);
     }
 }
 
 #[test]
-fn selectors_filter_all_hops_without_changing_flattened_weights() {
+fn unselected_large_pools_keep_constant_time_round_robin() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sockets: Vec<Arc<dyn SocketConnector>> = (0..10_000)
+        .map(|index| Arc::new(Socket(index, events.clone())) as Arc<dyn SocketConnector>)
+        .collect();
+    let chain = ClientProxyChain::new(
+        sockets
+            .iter()
+            .cloned()
+            .map(InitialHopEntry::Direct)
+            .collect(),
+        Vec::new(),
+    );
+    for index in 0..20_000 {
+        for udp in [false, true] {
+            let path = chain.select(udp).unwrap();
+            assert!(Arc::ptr_eq(
+                path.initial.socket(),
+                &sockets[index % sockets.len()]
+            ));
+        }
+    }
+}
+
+#[test]
+fn selectors_preserve_declared_branch_weights_and_duplicate_tickets() {
     let yaml = "
 - client_group: leaves
-  client_proxies:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {type: http}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
+  client_chains:
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {type: http}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
 - client_group: weighted
-  client_proxies: [leaves, leaves, direct]
+  client_chains: [{chain: [leaves]}, {chain: [leaves]}, {chain: [direct]}]
 - client_group: choose
   type: selector
-  client_proxies: [weighted, direct]
+  client_chains: [{chain: [weighted]}, {chain: [direct]}]
 - address: 127.0.0.1:1080
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: choose}]
@@ -166,21 +236,19 @@ fn selectors_filter_all_hops_without_changing_flattened_weights() {
     let mut validated =
         crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let group =
         crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver).unwrap();
     let chain = &group.chains[0];
-    for index in 0..10 {
-        assert_eq!(chain.select_indices(false).unwrap(), [index % 5]);
+    for index in [0, 2, 4, 1, 3, 4, 0, 2, 4, 1, 3, 4] {
+        assert_eq!(chain.select_indices(false).unwrap(), [index]);
     }
     for index in [1, 3, 4, 1, 3, 4] {
         assert_eq!(chain.select_indices(true).unwrap(), [index]);
@@ -192,42 +260,73 @@ fn selectors_filter_all_hops_without_changing_flattened_weights() {
     assert_eq!(chain.select_indices(true).unwrap(), [5]);
 }
 
-#[test]
-fn udp_selection_rejects_ineligible_member_without_falling_back() {
+#[tokio::test]
+async fn udp_selection_rejects_ineligible_member_without_falling_back() {
+    let tcp_only = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let udp_capable = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    for listener in [&tcp_only, &udp_capable] {
+        listener.set_nonblocking(true).unwrap();
+    }
     let yaml = "
 - client_group: leaves
   type: selector
   default: http
-  client_proxies:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {type: http}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
+  client_chains:
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {type: http}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
 - address: 127.0.0.1:1080
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: leaves}]
 ";
+    let mut config: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    for (index, listener) in [&tcp_only, &udp_capable].into_iter().enumerate() {
+        config[0]["client_chains"][index]["chain"][0]["address"] =
+            format!("127.0.0.1:{}", listener.local_addr().unwrap().port()).into();
+    }
     let mut validated =
-        crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
+        crate::config::create_server_configs(serde_yaml::from_value(config).unwrap()).unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let group =
-        crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver).unwrap();
+        crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver.clone())
+            .unwrap();
     let chain = &group.chains[0];
     let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
     owner.activate(catalog.selection.clone()).unwrap();
-    assert!(chain.select_indices(true).is_err());
+    assert_eq!(
+        chain.select_indices(true).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        chain.connect_udp_bidirectional(
+            &resolver,
+            NetLocation::from_str("192.0.2.1:53", None).unwrap().into(),
+        ),
+    )
+    .await
+    .unwrap()
+    .err()
+    .expect("selected HTTP branch must reject UDP");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    for listener in [&tcp_only, &udp_capable] {
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
     owner.select("leaves", "udp").unwrap();
     assert_eq!(chain.select_indices(true).unwrap(), [1]);
 }
@@ -273,7 +372,7 @@ impl ProxyConnector for Proxy {
     fn proxy_location(&self) -> &NetLocation {
         &self.location
     }
-    fn supports_udp_over_tcp(&self) -> bool {
+    fn supports_udp(&self) -> bool {
         true
     }
     fn needs_carrier_dialer(&self) -> bool {
@@ -381,6 +480,60 @@ async fn redial_replays_exact_selected_prefix_without_round_robin_or_direct_bypa
 }
 
 #[tokio::test]
+async fn linear_tcp_preserves_early_data_boundaries_on_fixed_and_composed_paths() {
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    for composed in [false, true] {
+        for hops in [1, 3] {
+            for early_hop in 0..hops {
+                for early_data in [None, Some(vec![]), Some(vec![1, 2, 3])] {
+                    let calls = Arc::new(Mutex::new(Vec::new()));
+                    let proxy = |hop| {
+                        Box::new(Proxy {
+                            location: NetLocation::from_str(&format!("hop{hop}.test:80"), None)
+                                .unwrap(),
+                            lazy: false,
+                            early_data: (hop == early_hop).then(|| early_data.clone()).flatten(),
+                            calls: calls.clone(),
+                        }) as Box<dyn ProxyConnector>
+                    };
+                    let chain = ClientProxyChain::new(
+                        (0..1 + usize::from(composed))
+                            .map(|index| InitialHopEntry::Proxy {
+                                socket: Arc::new(Socket(index, calls.clone())),
+                                proxy: proxy(0),
+                            })
+                            .collect(),
+                        (1..hops).map(|hop| vec![proxy(hop)]).collect(),
+                    );
+                    assert_eq!(chain.composition().is_some(), composed);
+                    let result = chain
+                        .connect_tcp(
+                            NetLocation::from_str("target.test:80", None)
+                                .unwrap()
+                                .into(),
+                            &resolver,
+                        )
+                        .await;
+                    if early_hop > 0 && early_hop + 1 < hops && early_data.is_some() {
+                        assert_eq!(
+                            result.err().unwrap().kind(),
+                            std::io::ErrorKind::InvalidData
+                        );
+                    } else {
+                        let expected = if early_hop + 1 == hops {
+                            early_data
+                        } else {
+                            None
+                        };
+                        assert_eq!(result.unwrap().early_data, expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn udp_chain_preserves_preparation_order_and_ignores_intermediate_early_data() {
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     for initial in ["direct", "wireguard", "proxy"] {
@@ -453,6 +606,90 @@ async fn udp_chain_preserves_preparation_order_and_ignores_intermediate_early_da
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn pinned_later_endpoint_does_not_replace_the_same_directly_dialed_hostname() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let proxy = || {
+        Box::new(Proxy {
+            location: NetLocation::from_str("same.test:443", None).unwrap(),
+            lazy: false,
+            early_data: None,
+            calls: calls.clone(),
+        }) as Box<dyn ProxyConnector>
+    };
+    let chain = ClientProxyChain::new(
+        vec![InitialHopEntry::Proxy {
+            socket: Arc::new(Socket(0, calls.clone())),
+            proxy: proxy(),
+        }],
+        vec![vec![proxy()]],
+    );
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let mut route = chain.select(false).unwrap().selected_route(&resolver);
+    route.pinned_proxies = Some(Arc::new(PinnedProxies {
+        endpoints: std::collections::HashMap::from([(
+            NetLocation::from_str("same.test:443", None).unwrap(),
+            vec!["127.0.0.2:443".parse().unwrap()],
+        )]),
+        extra_attempts: tokio::sync::Semaphore::new(1),
+    }));
+    route
+        .connect(NetLocation::from_str("192.0.2.1:80", None).unwrap().into())
+        .await
+        .unwrap();
+    let calls = calls.lock().unwrap();
+    assert!(
+        calls.iter().any(|call| call == "socket 0 -> same.test:443"),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == "same.test:443 -> 127.0.0.2:443"),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn pooled_prefix_keys_include_each_selected_connector_identity() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let proxy = || -> Box<dyn ProxyConnector> {
+        Box::new(Proxy {
+            location: NetLocation::from_str("same.test:443", None).unwrap(),
+            lazy: true,
+            early_data: None,
+            calls: calls.clone(),
+        })
+    };
+    let chain = ClientProxyChain::new(
+        vec![
+            InitialHopEntry::Direct(Arc::new(Socket(0, calls.clone()))),
+            InitialHopEntry::Direct(Arc::new(Socket(1, calls.clone()))),
+        ],
+        vec![vec![proxy(), proxy()], vec![proxy()]],
+    );
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let mut keys = std::collections::HashSet::new();
+    let paths = [chain.select(false).unwrap(), chain.select(false).unwrap()];
+    for indices in [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]] {
+        let mut path = paths[indices[0]].clone().into_owned();
+        path.subsequent[0] = paths[indices[1]].subsequent[0].clone();
+        let key = || {
+            path.selected_route(&resolver)
+                .prefix(NetLocation::from_str("same.test:443", None).unwrap().into())
+                .route_key()
+                .clone()
+        };
+        let first = key();
+        assert_eq!(first, key());
+        assert!(
+            keys.insert(first),
+            "different prefix collapsed: {indices:?}"
+        );
+    }
+}
+
 #[test]
 fn pooled_prefix_does_not_retain_its_own_proxy() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -468,10 +705,12 @@ fn pooled_prefix_does_not_retain_its_own_proxy() {
         }],
         vec![],
     );
-    let initial = Arc::downgrade(&chain.initial_hop[0]);
+    let initial = Arc::downgrade(&chain.select(false).unwrap().initial);
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let prefix = chain
-        .selected_route(&resolver, &chain.select_indices(false).unwrap())
+        .select(false)
+        .unwrap()
+        .selected_route(&resolver)
         .prefix(
             NetLocation::from_str("xhttp.test:443", None)
                 .unwrap()
@@ -480,4 +719,163 @@ fn pooled_prefix_does_not_retain_its_own_proxy() {
     drop(chain);
     assert!(initial.upgrade().is_none());
     assert_eq!(prefix.route_key().0.len(), 1);
+}
+
+mod pinned_fallback {
+    use super::*;
+    use std::collections::HashSet;
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct Handshakes {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    struct ActiveHandshake(Arc<Handshakes>);
+
+    impl Drop for ActiveHandshake {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug)]
+    struct Hop {
+        location: NetLocation,
+        stalled: Arc<HashSet<SocketAddr>>,
+        handshakes: Arc<Handshakes>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyConnector for Hop {
+        fn proxy_location(&self) -> &NetLocation {
+            &self.location
+        }
+
+        fn supports_udp(&self) -> bool {
+            false
+        }
+
+        async fn setup_tcp_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+            target: &ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            let active = self.handshakes.active.fetch_add(1, Ordering::Relaxed) + 1;
+            self.handshakes.peak.fetch_max(active, Ordering::Relaxed);
+            let _guard = ActiveHandshake(self.handshakes.clone());
+            if target
+                .location()
+                .to_socket_addr_nonblocking()
+                .is_some_and(|address| self.stalled.contains(&address))
+            {
+                std::future::pending::<()>().await;
+            }
+            Ok(TcpClientSetupResult {
+                client_stream: stream,
+                early_data: None,
+            })
+        }
+
+        async fn setup_udp_bidirectional(
+            &self,
+            _: Box<dyn AsyncStream>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+    }
+
+    fn addresses(port: u16) -> [SocketAddr; 2] {
+        [
+            SocketAddr::from(([192, 0, 2, 1], port)),
+            SocketAddr::from(([198, 51, 100, 1], port)),
+        ]
+    }
+
+    #[derive(Debug)]
+    struct Answers;
+
+    impl Resolver for Answers {
+        fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+            assert!(
+                location.port() > 1,
+                "directly dialed proxy must not be pinned"
+            );
+            let addresses = addresses(location.port()).to_vec();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+
+    fn chain(
+        levels: u16,
+        stalled: impl IntoIterator<Item = SocketAddr>,
+        handshakes: &Arc<Handshakes>,
+    ) -> ClientProxyChain {
+        let stalled = Arc::new(stalled.into_iter().collect());
+        let proxy = |port| {
+            Box::new(Hop {
+                location: NetLocation::from_str(&format!("hop{port}.test:{port}"), None).unwrap(),
+                stalled: Arc::clone(&stalled),
+                handshakes: handshakes.clone(),
+            }) as Box<dyn ProxyConnector>
+        };
+        ClientProxyChain::new(
+            vec![InitialHopEntry::Proxy {
+                socket: Arc::new(Socket(0, Arc::new(Mutex::new(Vec::new())))),
+                proxy: proxy(1),
+            }],
+            (2..=levels + 1).map(|port| vec![proxy(port)]).collect(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_first_handshake_bounds_nested_races_and_cancellation() {
+        for levels in [1, 4] {
+            let handshakes = Arc::new(Handshakes::default());
+            let chain = chain(levels, addresses(2), &handshakes);
+            let resolver: Arc<dyn Resolver> = Arc::new(Answers);
+            let target = NetLocation::from_str("203.0.113.1:80", None).unwrap();
+            let mut connect = Box::pin(chain.connect_tcp_pinned(target.into(), &resolver));
+            assert!(futures::poll!(&mut connect).is_pending());
+            for _ in 0..8 {
+                tokio::time::advance(Duration::from_millis(250)).await;
+                assert!(futures::poll!(&mut connect).is_pending());
+            }
+            let active = handshakes.active.load(Ordering::Relaxed);
+            let peak = handshakes.peak.load(Ordering::Relaxed);
+            drop(connect);
+            assert_eq!(handshakes.active.load(Ordering::Relaxed), 0);
+            assert!(active > 1, "fallback must remain concurrent");
+            assert!(
+                peak <= usize::from(levels) + 1,
+                "{levels} levels: peak {peak}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nested_stalled_addresses_reach_viable_alternatives() {
+        for stalled in [
+            vec![addresses(2)[0]],
+            vec![addresses(3)[0]],
+            vec![addresses(2)[0], addresses(3)[0]],
+        ] {
+            let handshakes = Arc::new(Handshakes::default());
+            let chain = chain(2, stalled, &handshakes);
+            let resolver: Arc<dyn Resolver> = Arc::new(Answers);
+            let target = NetLocation::from_str("203.0.113.1:80", None).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                chain.connect_tcp_pinned(target.into(), &resolver),
+            )
+            .await
+            .expect("nested fallback must complete before the connection deadline")
+            .unwrap();
+            assert_eq!(handshakes.active.load(Ordering::Relaxed), 0);
+        }
+    }
 }

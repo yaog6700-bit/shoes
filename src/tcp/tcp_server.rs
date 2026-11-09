@@ -11,8 +11,8 @@ use tokio::time::timeout;
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use super::tcp_server_handler_factory::create_tcp_server_handler;
 
-use crate::async_stream::{AsyncMessageStream, AsyncStream};
-use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
+use crate::async_stream::{AsyncFlushMessage, AsyncMessageStream, AsyncStream};
+use crate::config::{BindLocation, ResolvedConfig, ResolvedServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::quic_server::start_quic_servers;
@@ -23,6 +23,22 @@ use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerS
 #[cfg(unix)]
 use crate::tun::start_tun_server;
 use crate::util::write_all;
+
+async fn send_connect_failure(
+    stream: &mut Box<dyn AsyncStream>,
+    response: Option<fn(std::io::ErrorKind) -> Vec<u8>>,
+    kind: std::io::ErrorKind,
+) {
+    let _ = timeout(crate::util::SHUTDOWN_TIMEOUT, async {
+        if let Some(response) = response
+            && stream.write_all(&response(kind)).await.is_ok()
+        {
+            let _ = stream.flush().await;
+        }
+        stream.shutdown().await
+    })
+    .await;
+}
 
 async fn run_tcp_server(
     listener: Arc<tokio::net::TcpListener>,
@@ -178,6 +194,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
             mut connection_success_response,
+            mut connection_failure_response,
             initial_remote_data,
         } => {
             let setup_client_stream_future = async {
@@ -191,6 +208,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                     if prepared.needs_sniff_read() {
                         crate::util::timeout_stream_setup(async {
                             let response = connection_success_response.take();
+                            connection_failure_response = None;
                             let flush = response.is_some() || server_need_initial_flush;
                             if let Some(data) = response {
                                 write_all(&mut server_stream, &data).await?;
@@ -216,14 +234,20 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             let routed = match setup_client_stream_future.await {
                 Ok(Ok(routed)) => routed,
                 Ok(Err(e)) => {
-                    crate::util::shutdown_stream(&mut server_stream).await;
+                    send_connect_failure(&mut server_stream, connection_failure_response, e.kind())
+                        .await;
                     return Err(std::io::Error::new(
                         e.kind(),
                         format!("failed to setup client stream to {remote_location}: {e}"),
                     ));
                 }
                 Err(elapsed) => {
-                    crate::util::shutdown_stream(&mut server_stream).await;
+                    send_connect_failure(
+                        &mut server_stream,
+                        connection_failure_response,
+                        std::io::ErrorKind::TimedOut,
+                    )
+                    .await;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!("client setup to {remote_location} timed out: {elapsed}"),
@@ -237,7 +261,12 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                 early_data,
             }) = routed.setup
             else {
-                crate::util::shutdown_stream(&mut server_stream).await;
+                send_connect_failure(
+                    &mut server_stream,
+                    connection_failure_response,
+                    std::io::ErrorKind::PermissionDenied,
+                )
+                .await;
                 return Ok(());
             };
             log::debug!("TCP setup completed for {}", routed.wire_destination);
@@ -284,30 +313,40 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
         }
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
-            stream: mut server_stream,
-            need_initial_flush: server_need_initial_flush,
+            stream: server_stream,
+            need_initial_flush: mut server_need_initial_flush,
             proxy_selector,
         } => {
+            let mut server_stream = crate::routing::ingress::PeekMessageStream::new(server_stream);
             let setup = crate::util::timeout_stream_setup(async {
-                crate::routing::ingress::connect_udp(
-                    &proxy_selector,
-                    remote_location,
-                    &resolver,
-                    source,
-                )
-                .await
-                .map_err(|error| {
-                    if crate::routing::ingress::is_policy_block(&error) {
-                        std::io::Error::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            "Blocked bidirectional udp forward",
-                        )
-                    } else {
-                        error
-                    }
-                })
+                let prepared =
+                    crate::routing::ingress::PreparedUdp::new(&proxy_selector, remote_location)?;
+                if prepared.needs_sniff(&proxy_selector) && server_need_initial_flush {
+                    futures::future::poll_fn(|cx| {
+                        std::pin::Pin::new(&mut server_stream).poll_flush_message(cx)
+                    })
+                    .await?;
+                    server_need_initial_flush = false;
+                }
+                prepared
+                    .route(&mut server_stream, &proxy_selector, &resolver)
+                    .await?
+                    .with_source(source)
+                    .connect(&resolver)
+                    .await
+                    .map(|setup| setup.stream)
             })
-            .await;
+            .await
+            .map_err(|error| {
+                if crate::routing::ingress::is_policy_block(&error) {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Blocked bidirectional udp forward",
+                    )
+                } else {
+                    error
+                }
+            });
             let client_stream = match setup {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -365,9 +404,9 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
 /// After the copy completes (whether successfully or with an error), both streams
 /// are shut down to ensure proper cleanup and FIN frames are sent.
 #[inline]
-pub async fn run_udp_copy(
-    mut server_stream: Box<dyn AsyncMessageStream>,
-    mut client_stream: Box<dyn AsyncMessageStream>,
+pub async fn run_udp_copy<S: AsyncMessageStream, C: AsyncMessageStream>(
+    mut server_stream: S,
+    mut client_stream: C,
     server_need_initial_flush: bool,
     client_need_initial_flush: bool,
 ) -> std::io::Result<()> {
@@ -402,7 +441,7 @@ pub async fn run_udp_copy(
 
 #[cfg(any(test, target_os = "android", target_os = "ios", feature = "ffi"))]
 pub async fn start_servers(
-    config: Config,
+    config: ResolvedConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     start_servers_with_listeners(config, resolver, &mut TcpListeners::default()).await
@@ -419,7 +458,7 @@ pub(crate) struct TcpListeners {
 
 impl TcpListeners {
     pub(crate) fn prepare(
-        configs: &[Config],
+        configs: &[ResolvedConfig],
         previous: &Self,
         retiring_http: &[SocketAddr],
     ) -> std::io::Result<Self> {
@@ -427,7 +466,7 @@ impl TcpListeners {
         next.defer_admission();
         let mut seen = std::collections::HashSet::new();
         for config in configs {
-            let Config::Server(server) = config else {
+            let ResolvedConfig::Server(server) = config else {
                 continue;
             };
             if server.transport != Transport::Tcp {
@@ -517,13 +556,13 @@ impl TcpListeners {
 }
 
 pub(crate) async fn start_servers_with_listeners(
-    config: Config,
+    config: ResolvedConfig,
     resolver: Arc<dyn Resolver>,
     listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
         #[cfg(unix)]
-        Config::TunServer(tun_config) => {
+        ResolvedConfig::TunServer(tun_config) => {
             let task = tokio_util::task::AbortOnDropHandle::new(
                 start_tun_server(tun_config, resolver).await?,
             );
@@ -537,22 +576,18 @@ pub(crate) async fn start_servers_with_listeners(
             })])
         }
         #[cfg(not(unix))]
-        Config::TunServer(_) => Err(std::io::Error::new(
+        ResolvedConfig::TunServer(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => {
+        ResolvedConfig::Server(server_config) => {
             start_tcp_or_quic_servers(server_config, resolver, listeners).await
         }
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Expected a server configuration",
-        )),
     }
 }
 
 async fn start_tcp_or_quic_servers(
-    config: ServerConfig,
+    config: ResolvedServerConfig,
     resolver: Arc<dyn Resolver>,
     listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
@@ -579,11 +614,11 @@ async fn start_tcp_or_quic_servers(
 }
 
 async fn start_tcp_servers(
-    config: ServerConfig,
+    config: ResolvedServerConfig,
     resolver: Arc<dyn Resolver>,
     sockets: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let ServerConfig {
+    let ResolvedServerConfig {
         bind_location,
         tcp_settings,
         protocol,
@@ -594,7 +629,7 @@ async fn start_tcp_servers(
 
     println!("Starting {} TCP server at {}", protocol, bind_location);
 
-    let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
+    let rules = rules.into_vec();
     // We should always have a direct entry.
     assert!(!rules.is_empty());
 

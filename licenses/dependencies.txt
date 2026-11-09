@@ -667,14 +667,18 @@ Repository: https://github.com/jhpratt/deranged
 License: Apache License 2.0 (Apache-2.0)
 Package: cmov 0.5.4
 Repository: https://github.com/RustCrypto/utils
-Package: ctutils 0.4.6
+Package: ctutils 0.4.8
 Repository: https://github.com/RustCrypto/utils
 Package: lru-slab 0.1.3
 Repository: https://github.com/Ralith/lru-slab
+Package: sntpc 0.11.0
+Repository: https://github.com/vpetrigo/sntpc
 Package: tinyvec 1.13.3
 Repository: https://github.com/Lokathor/tinyvec
-Package: utf8_iter 1.0.4
+Package: utf8_iter 1.1.0
 Repository: https://github.com/hsivonen/utf8_iter
+Package: utf_types 1.0.0
+Repository: https://github.com/hsivonen/utf_types
 Package: zeroize 1.9.1
 Repository: https://github.com/RustCrypto/utils
 Package: zeroize_derive 1.5.0
@@ -2266,8 +2270,6 @@ Package: quinn-udp 0.5.16
 Repository: https://github.com/quinn-rs/quinn
 Package: quinn 0.11.12
 Repository: https://github.com/quinn-rs/quinn
-Package: rustls-platform-verifier 0.7.1
-Repository: https://github.com/rustls/rustls-platform-verifier
 
                                  Apache License
                            Version 2.0, January 2004
@@ -2889,7 +2891,7 @@ Repository: https://github.com/achanda/ipnetwork
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: crc32fast 1.5.3
+Package: crc32fast 1.5.4
 Repository: https://github.com/srijs/rust-crc32fast
 Package: env_filter 0.1.4
 Repository: https://github.com/rust-cli/env_logger
@@ -4784,7 +4786,7 @@ limitations under the License.
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: notify-types 2.1.0
+Package: notify-types 2.2.0
 Repository: https://github.com/notify-rs/notify.git
 
                               Apache License
@@ -5432,7 +5434,7 @@ Package: blocking 1.7.0
 Repository: https://github.com/smol-rs/blocking
 Package: bumpalo 3.20.3
 Repository: https://github.com/fitzgen/bumpalo
-Package: cc 1.10.0
+Package: cc 1.11.0
 Repository: https://github.com/rust-lang/cc-rs
 Package: cfg-if 1.0.5
 Repository: https://github.com/rust-lang/cfg-if
@@ -5441,8 +5443,6 @@ Repository: https://github.com/rust-lang/cmake-rs
 Package: concurrent-queue 2.5.0
 Repository: https://github.com/smol-rs/concurrent-queue
 Package: core-foundation-sys 0.8.7
-Repository: https://github.com/servo/core-foundation-rs
-Package: core-foundation 0.10.1
 Repository: https://github.com/servo/core-foundation-rs
 Package: core-foundation 0.9.4
 Repository: https://github.com/servo/core-foundation-rs
@@ -5506,15 +5506,15 @@ Package: itertools 0.14.0
 Repository: https://github.com/rust-itertools/itertools
 Package: jobserver 0.1.35
 Repository: https://github.com/rust-lang/jobserver-rs
-Package: js-sys 0.3.106
+Package: js-sys 0.3.107
 Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 Package: lazy_static 1.5.1
 Repository: https://github.com/rust-lang-nursery/lazy-static.rs
 Package: lock_api 0.4.14
 Repository: https://github.com/Amanieu/parking_lot
-Package: log 0.4.34
+Package: log 0.4.35
 Repository: https://github.com/rust-lang/log
-Package: mime 0.3.17
+Package: mime 0.3.18
 Repository: https://github.com/hyperium/mime
 Package: num-bigint 0.4.8
 Repository: https://github.com/rust-num/num-bigint
@@ -5526,8 +5526,6 @@ Package: oid-registry 0.8.1
 Repository: https://github.com/rusticata/oid-registry.git
 Package: once_cell 1.21.4
 Repository: https://github.com/matklad/once_cell
-Package: openssl-probe 0.2.2
-Repository: https://github.com/rustls/openssl-probe
 Package: parking 2.2.1
 Repository: https://github.com/smol-rs/parking
 Package: parking_lot 0.12.5
@@ -5556,14 +5554,8 @@ Package: rustc_version 0.4.1
 Repository: https://github.com/djc/rustc-version-rs
 Package: rusticata-macros 4.1.0
 Repository: https://github.com/rusticata/rusticata-macros.git
-Package: rustls-native-certs 0.8.5
-Repository: https://github.com/rustls/rustls-native-certs
 Package: scopeguard 1.2.0
 Repository: https://github.com/bluss/scopeguard
-Package: security-framework-sys 2.17.0
-Repository: https://github.com/kornelski/rust-security-framework
-Package: security-framework 3.7.0
-Repository: https://github.com/kornelski/rust-security-framework
 Package: signal-hook-registry 1.4.8
 Repository: https://github.com/vorner/signal-hook
 Package: simd_cesu8 1.2.0
@@ -5600,13 +5592,13 @@ Package: wasi 0.11.1+wasi-snapshot-preview1
 Repository: https://github.com/bytecodealliance/wasi
 Package: wasip2 1.0.4+wasi-0.2.12
 Repository: https://github.com/bytecodealliance/wasi-rs
-Package: wasm-bindgen-macro-support 0.2.129
+Package: wasm-bindgen-macro-support 0.2.130
 Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support
-Package: wasm-bindgen-macro 0.2.129
+Package: wasm-bindgen-macro 0.2.130
 Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro
-Package: wasm-bindgen-shared 0.2.129
+Package: wasm-bindgen-shared 0.2.130
 Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
-Package: wasm-bindgen 0.2.129
+Package: wasm-bindgen 0.2.130
 Repository: https://github.com/wasm-bindgen/wasm-bindgen
 Package: wit-bindgen 0.57.1
 Repository: https://github.com/bytecodealliance/wit-bindgen
@@ -6234,6 +6226,8 @@ limitations under the License.
 License: Apache License 2.0 (Apache-2.0)
 Package: blake2 0.10.6
 Repository: https://github.com/RustCrypto/hashes
+Package: blake2 0.11.0
+Repository: https://github.com/RustCrypto/hashes
 Package: block-buffer 0.10.4
 Repository: https://github.com/RustCrypto/utils
 Package: block-buffer 0.12.1
@@ -6270,9 +6264,9 @@ Package: keccak 0.2.2
 Repository: https://github.com/RustCrypto/sponges
 Package: md-5 0.11.0
 Repository: https://github.com/RustCrypto/hashes
-Package: ml-kem 0.3.3
+Package: ml-kem 0.3.4
 Repository: https://github.com/RustCrypto/KEMs
-Package: module-lattice 0.2.3
+Package: module-lattice 0.2.4
 Repository: https://github.com/RustCrypto/KEMs
 Package: opaque-debug 0.3.1
 Repository: https://github.com/RustCrypto/utils
@@ -7318,7 +7312,7 @@ limitations under the License.
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: aws-lc-sys 0.46.0
+Package: aws-lc-sys 0.47.0
 Repository: https://github.com/aws/aws-lc-rs
 
 AWS Libcrypto (AWS-LC)
@@ -8349,8 +8343,6 @@ Package: rcgen 0.14.10
 Repository: https://github.com/rustls/rcgen
 Package: rustc-hash 2.1.3
 Repository: https://github.com/rust-lang/rustc-hash
-Package: rustls-platform-verifier-android 0.2.0
-Repository: https://github.com/rustls/rustls-platform-verifier
 Package: rustversion 1.0.23
 Repository: https://github.com/dtolnay/rustversion
 Package: ryu 1.0.23
@@ -8804,7 +8796,7 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 License: BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
-Package: aws-lc-sys 0.46.0
+Package: aws-lc-sys 0.47.0
 Repository: https://github.com/aws/aws-lc-rs
 
 AWS Libcrypto (AWS-LC)
@@ -9313,8 +9305,6 @@ For these and/or other purposes and motivations, and without any expectation of 
      d. Affirmer understands and acknowledges that Creative Commons is not a party to this document and has no duty or obligation with respect to this CC0 or use of the Work. 
 
 License: Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
-Package: webpki-root-certs 1.0.11
-Repository: https://github.com/rustls/webpki-roots
 Package: webpki-roots 1.0.11
 Repository: https://github.com/rustls/webpki-roots
 
@@ -9403,7 +9393,7 @@ Repository: https://github.com/briansmith/untrusted
 
 
 License: ISC License (ISC)
-Package: aws-lc-sys 0.46.0
+Package: aws-lc-sys 0.47.0
 Repository: https://github.com/aws/aws-lc-rs
 
 AWS Libcrypto (AWS-LC)
@@ -9824,7 +9814,7 @@ third-party/chromium/LICENSE.
 
 
 License: ISC License (ISC)
-Package: aws-lc-rs 1.18.2
+Package: aws-lc-rs 1.19.0
 Repository: https://github.com/aws/aws-lc-rs
 
 SPDX-License-Identifier: ISC AND (Apache-2.0 OR ISC)
@@ -10064,7 +10054,7 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 
 
 License: MIT License (MIT)
-Package: aws-lc-sys 0.46.0
+Package: aws-lc-sys 0.47.0
 Repository: https://github.com/aws/aws-lc-rs
 
 AWS Libcrypto (AWS-LC)
@@ -10459,19 +10449,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
-
-License: MIT License (MIT)
-Package: schannel 0.1.30
-Repository: https://github.com/steffengy/schannel-rs
-
-Copyright (c) 2015 steffengy
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 License: MIT License (MIT)
@@ -10883,6 +10860,125 @@ THE SOFTWARE.
 
 
 License: MIT License (MIT)
+Package: tendns 0.2.0
+Repository: https://github.com/cfal/tendns
+
+Copyright (c) 2026 Alex Lau <github@alau.ca>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+License: MIT License (MIT)
+Package: netlink-packet-route 0.34.0
+Repository: https://github.com/rust-netlink/netlink-packet-route
+
+Copyright (c) The netlink-packet-route Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+License: MIT License (MIT)
+Package: netlink-proto 0.14.1
+Repository: https://github.com/rust-netlink/netlink-proto
+
+Copyright (c) The netlink-proto Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+License: MIT License (MIT)
+Package: rtnetlink 0.24.0
+Repository: https://github.com/rust-netlink/rtnetlink
+
+Copyright (c) The rtnetlink Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+License: MIT License (MIT)
 Package: synstructure 0.13.2
 Repository: https://github.com/mystor/synstructure
 Package: synstructure 0.14.0
@@ -11231,6 +11327,39 @@ DEALINGS IN THE SOFTWARE.
 
 
 License: MIT License (MIT)
+Package: netlink-packet-core 0.9.0
+Repository: https://github.com/rust-netlink/netlink-packet-core
+Package: netlink-sys 0.9.0
+Repository: https://github.com/rust-netlink/netlink-sys
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+Distributions of all or part of the Software intended to be used by the
+recipients as they would use the unmodified Software, containing modifications
+that substantially alter, remove, or disable functionality of the Software,
+outside of the documented configuration mechanisms provided by the Software,
+shall be modified such that the Original Author's bug reporting email addresses
+and urls are either replaced with the contact information of the parties
+responsible for the changes, or removed entirely.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+License: MIT License (MIT)
 Package: aho-corasick 1.1.5
 Repository: https://github.com/BurntSushi/aho-corasick
 Package: byteorder 1.5.0
@@ -11485,6 +11614,10 @@ SOFTWARE.
 
 License: Mozilla Public License 2.0 (MPL-2.0)
 Package: gotatun 0.10.2
+Repository: https://github.com/mullvad/gotatun
+Package: gotatun-crypto 0.1.0
+Repository: https://github.com/mullvad/gotatun
+Package: gotatun-packet 0.1.0
 Repository: https://github.com/mullvad/gotatun
 
 Mozilla Public License Version 2.0

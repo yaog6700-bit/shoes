@@ -1,6 +1,7 @@
+use crate::atomic::AtomicU64;
 use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::RwLock;
@@ -224,12 +225,6 @@ async fn stop_automatic(task: Option<AbortOnDropHandle<()>>) {
     }
 }
 
-async fn stop_health(service: Option<super::health::HealthService>) {
-    if let Some(service) = service {
-        service.shutdown().await;
-    }
-}
-
 async fn run_owner(
     mut owner: SelectionOwner,
     mut receiver: mpsc::Receiver<Command>,
@@ -237,7 +232,6 @@ async fn run_owner(
     shutdown: CancellationToken,
 ) {
     let mut paused = false;
-    let mut health: Option<super::health::HealthService> = None;
     let mut pending: VecDeque<SelectionCommand> = VecDeque::new();
     let mut automatic: Option<AbortOnDropHandle<()>> = None;
     loop {
@@ -275,7 +269,6 @@ async fn run_owner(
             Command::Begin(view, reply) => {
                 let result = owner.reconcile(&view);
                 if result.is_ok() {
-                    stop_health(health.take()).await;
                     paused = true;
                     if let Some(runtime) = runtime.upgrade() {
                         let _active = runtime.active.write();
@@ -287,7 +280,6 @@ async fn run_owner(
                 let _ = reply.send(result);
             }
             Command::Publish(generation, reply) => {
-                stop_health(health.take()).await;
                 let result = owner.activate(generation.catalog.selection.clone());
                 if result.is_ok()
                     && let Some(runtime) = runtime.upgrade()
@@ -303,16 +295,6 @@ async fn run_owner(
                 stop_automatic(automatic.take()).await;
                 if let Some(runtime) = runtime.upgrade() {
                     let generation = runtime.generation();
-                    if health.is_none()
-                        && let Ok(generation) = &generation
-                        && !generation.catalog.selection.health.definitions.is_empty()
-                    {
-                        health = Some(super::health::HealthService::start(
-                            generation.catalog.selection.clone(),
-                            runtime.probes.clone(),
-                            generation.probes.forbidden_ranges(),
-                        ));
-                    }
                     runtime.activating.store(false, Ordering::Release);
                     if let Ok(generation) = generation
                         && !generation.catalog.selection.automatic.0.is_empty()
@@ -364,7 +346,6 @@ async fn run_owner(
         }
     }
     stop_automatic(automatic).await;
-    stop_health(health).await;
 }
 
 #[cfg(test)]
@@ -441,7 +422,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let cache = directory.path().join("cache.db");
             let mut configs = serde_json::json!([
-                {"client_group":"outbound", "type":if mode == "selector" { "selector" } else { "round-robin" }, "client_proxies":[
+                {"client_group":"outbound", "type":if mode == "selector" { "selector" } else { "round-robin" }, "client_chains":[
                     {"name":"proxy", "address":"proxy.invalid:8080", "protocol":{"type":"http"}}
                 ]},
                 {"name":"entry", "address":"127.0.0.1:0", "protocol":{"type":"socks"}, "rules":[
@@ -467,13 +448,10 @@ mod tests {
             let (id, rules) = service.runtime.prepare(&mut validated).await.unwrap();
             assert_eq!(rules.len(), 1, "{mode}");
             assert_eq!(rules[0]["proxy"], "outbound", "{mode}");
-            let crate::config::Config::Server(server) = &validated.configs[0] else {
+            let crate::config::ResolvedConfig::Server(server) = &validated.configs[0] else {
                 panic!("{mode}")
             };
-            let crate::config::ConfigSelection::Config(rule) = server.rules.iter().next().unwrap()
-            else {
-                panic!("{mode}")
-            };
+            let rule = server.rules.iter().next().unwrap();
             let description = rule.criteria.description.as_ref().unwrap();
             assert_eq!(description.proxy, "outbound", "{mode}");
             if mode == "listener" {

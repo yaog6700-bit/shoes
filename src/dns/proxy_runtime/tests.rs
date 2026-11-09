@@ -6,6 +6,77 @@ use crate::tcp::chain_builder::build_direct_chain_group;
 use crate::tcp::socket_connector::SocketConnector;
 use async_trait::async_trait;
 
+#[tokio::test]
+async fn downstream_dns_proxy_names_remain_remote_for_forwarding() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug)]
+    struct RemoteOnly;
+    impl Resolver for RemoteOnly {
+        fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "second.invalid");
+            Box::pin(async { Err(io::Error::other("proxy name is only resolvable remotely")) })
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for downstream in [true, false] {
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                stream.write_all(&[5, 0]).await.unwrap();
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(header, [5, 1, 0, if downstream { 3 } else { 1 }]);
+                if downstream {
+                    let length = stream.read_u8().await.unwrap();
+                    let mut name = vec![0; length as usize];
+                    stream.read_exact(&mut name).await.unwrap();
+                    assert_eq!(name, b"second.invalid");
+                    assert_eq!(stream.read_u16().await.unwrap(), 1080);
+                } else {
+                    let mut address = [0; 4];
+                    stream.read_exact(&mut address).await.unwrap();
+                    assert_eq!(address, [192, 0, 2, 53]);
+                    assert_eq!(stream.read_u16().await.unwrap(), 80);
+                }
+                stream
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                    .await
+                    .unwrap();
+            }
+            assert!(stream.read_u8().await.is_err());
+        })
+        .await
+        .unwrap();
+    });
+    let resolver: Arc<dyn Resolver> = Arc::new(RemoteOnly);
+    let chain = crate::config::test_support::from_json(serde_json::json!([
+        {"address": first.to_string(), "protocol": {"type": "socks"}},
+        {"address": "second.invalid:1080", "protocol": {"type": "socks"}}
+    ]))
+    .unwrap();
+    let chains = Arc::new(
+        crate::tcp::chain_builder::build_client_chain_group_with_limits(
+            crate::option_util::NoneOrSome::One(chain),
+            resolver.clone(),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let provider = ProxyRuntimeProvider::with_bootstrap(chains, resolver, Duration::from_secs(2));
+    drop(
+        provider
+            .connect_tcp("192.0.2.53:80".parse().unwrap(), None, None)
+            .await
+            .unwrap(),
+    );
+    fixture.await.unwrap();
+}
+
 #[derive(Debug)]
 struct PendingSocketConnector;
 
@@ -81,12 +152,14 @@ async fn new_dns_sockets_follow_direct_selector_changes() {
 - client_group: dns-route
   type: selector
   default: usable
-  client_proxies:
-    - name: unavailable
-      bind_interface: shoes-missing
-      protocol: {type: direct}
-    - name: usable
-      protocol: {type: direct}
+  client_chains:
+    - chain:
+        - name: unavailable
+          bind_interface: shoes-missing
+          protocol: {type: direct}
+    - chain:
+        - name: usable
+          protocol: {type: direct}
 - dns_group: upstream
   dns_servers:
     - url: udp://192.0.2.1
@@ -183,16 +256,11 @@ fn run_quic_test_in_child(name: &str) -> bool {
         .unwrap();
         return false;
     }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            &format!("dns::proxy_runtime::tests::{name}"),
-            "--nocapture",
-        ])
-        .env("SHOES_DNS_QUIC_TEST_CHILD", name)
-        .status()
-        .unwrap();
-    assert!(status.success());
+    shoes_test_support::isolated::run_isolated(
+        &format!("dns::proxy_runtime::tests::{name}"),
+        "SHOES_DNS_QUIC_TEST_CHILD",
+        name,
+    );
     true
 }
 

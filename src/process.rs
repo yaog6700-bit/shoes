@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use notify::RecommendedWatcher;
@@ -7,34 +7,112 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::address::NetLocation;
+use crate::config::ResolvedConfig;
 use crate::config::{self, BindLocation, Config, ValidatedConfigs};
 use crate::dns::{self, DnsRegistry};
-use crate::file_watcher::watch;
 use crate::option_util::OneOrSome;
 use crate::resources;
 use crate::tcp::tcp_server::TcpListeners;
 
+#[cfg(unix)]
+use crate::rule_updater::CacheLease;
+#[cfg(not(unix))]
+type CacheLease = std::fs::File;
+
 const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
-async fn load_validated(
+type DiscoverDependencies<'a> = dyn FnMut(&[PathBuf], &[PathBuf], Option<&Path>) + Send + 'a;
+
+async fn validate_configs(
     paths: &[String],
-    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
+    configs: Vec<Config>,
+    discovered: &mut DiscoverDependencies<'_>,
 ) -> io::Result<ValidatedConfigs> {
-    let mut configs = config::load_configs(&paths.to_vec()).await?;
+    load_candidate(paths, configs, discovered, false, None, &mut None, &[])
+        .await
+        .map(|(validated, _, _)| validated)
+}
+
+async fn load_candidate(
+    paths: &[String],
+    mut configs: Vec<Config>,
+    discovered: &mut DiscoverDependencies<'_>,
+    for_runtime: bool,
+    previous_servers: Option<&PreparedServers>,
+    cache_lease: &mut Option<std::sync::Arc<CacheLease>>,
+    retained_ranges: &[ipnetwork::IpNetwork],
+) -> io::Result<(
+    ValidatedConfigs,
+    Vec<Config>,
+    crate::rule_set::MemorySources,
+)> {
     async {
+        let expected_cache_dir =
+            previous_servers.map(|previous| &previous.validated.rule_cache_dir);
+        let cache_dir = crate::rule_set::cache_directory(&configs)?;
         let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
         let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
         dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
         recovery_dependencies.retain(|path| !dependencies.contains(path));
-        discovered(&dependencies, &recovery_dependencies);
-        let (configs, _) = config::convert_cert_paths(configs).await?;
-        let mut validated = config::compile_configs(configs).await?;
+        discovered(
+            &dependencies,
+            &recovery_dependencies,
+            expected_cache_dir.unwrap_or(&cache_dir).as_deref(),
+        );
+        let config_files: Vec<_> = paths.iter().map(PathBuf::from).collect();
+        crate::rule_set::validate_remote_paths(&mut configs, &config_files)?;
+        if let Some(expected) = expected_cache_dir
+            && &cache_dir != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "changing rule_cache_dir requires a restart",
+            ));
+        }
+        #[cfg(unix)]
+        if for_runtime
+            && cache_lease.is_none()
+            && let Some(directory) = cache_dir
+        {
+            *cache_lease = Some(std::sync::Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    crate::rule_updater::create_cache_directory(&directory)?;
+                    crate::rule_updater::cache_lease(&directory)
+                })
+                .await
+                .map_err(io::Error::other)??,
+            ));
+        }
+        #[cfg(not(unix))]
+        let _ = (cache_lease, retained_ranges);
+        let (mut configs, _) = config::convert_cert_paths(configs).await?;
+        let mut memory = crate::rule_set::MemorySources::new();
+        #[cfg(unix)]
+        if for_runtime {
+            (configs, memory) = crate::rule_updater::bootstrap(
+                configs,
+                retained_ranges,
+                previous_servers
+                    .map(|previous| previous.remote_rules.memory.clone())
+                    .unwrap_or_default(),
+                cache_lease.clone(),
+            )
+            .await?;
+        }
+        let snapshot = if memory.is_empty() {
+            Vec::new()
+        } else {
+            configs.clone()
+        };
+        let mut validated =
+            config::compile_configs_with_memory(configs, for_runtime.then(|| memory.clone()))
+                .await?;
         validated.reload_files = dependencies;
         tokio::task::spawn_blocking(move || {
             if validated.catalog.is_some() {
                 crate::control::validation::validate_resources(&validated)?;
             }
-            Ok(validated)
+            Ok((validated, snapshot, memory))
         })
         .await
         .map_err(io::Error::other)?
@@ -49,6 +127,12 @@ async fn load_validated(
 }
 
 struct PreparedServers {
+    ntp: crate::ntp::Prepared,
+    #[cfg(target_os = "linux")]
+    managed: Option<std::sync::Arc<crate::desktop::Ingress>>,
+    cache_lease: Option<std::sync::Arc<CacheLease>>,
+    #[cfg(unix)]
+    remote_rules: crate::rule_updater::Refresh,
     generation: Option<std::sync::Arc<crate::control::runtime::Generation>>,
     certificates: crate::certificates::Registry,
     validated: ValidatedConfigs,
@@ -62,17 +146,47 @@ struct PreparedServers {
 
 #[cfg(test)]
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
-    prepare_tracking(paths, previous, None, &mut |_, _| {}, &mut None).await
+    prepare_tracking(
+        paths,
+        config::load_config_files(paths).await?,
+        previous,
+        None,
+        &mut |_, _, _| {},
+        &mut None,
+        &crate::desktop::NetworkSession::default(),
+    )
+    .await
 }
 
 async fn prepare_tracking(
     paths: &[String],
+    configs: Vec<Config>,
     previous: Option<&DnsRegistry>,
     previous_servers: Option<&PreparedServers>,
-    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
+    discovered: &mut DiscoverDependencies<'_>,
     control: &mut Option<crate::control::runtime::ControlService>,
+    network: &crate::desktop::NetworkSession,
 ) -> io::Result<PreparedServers> {
-    let mut validated = load_validated(paths, discovered).await?;
+    let mut cache_lease = previous_servers.and_then(|previous| previous.cache_lease.clone());
+    let (mut validated, snapshot, memory) = load_candidate(
+        paths,
+        configs,
+        discovered,
+        true,
+        previous_servers,
+        &mut cache_lease,
+        previous.map_or(&[], DnsRegistry::forbidden_ranges),
+    )
+    .await?;
+    network.validate(&validated.configs)?;
+    for config in &mut validated.configs {
+        if let ResolvedConfig::TunServer(tun) = config
+            && tun.auto_route
+            && tun.dns_hijack.is_none()
+        {
+            tun.dns_hijack = Some(true);
+        }
+    }
     if control.is_none() && validated.catalog.is_some() {
         if previous.is_some()
             && (!validated.control.listeners.is_empty()
@@ -109,7 +223,7 @@ async fn prepare_tracking(
         crate::wireguard::Prepared::new(&mut validated).await?
     };
     for config in &mut validated.configs {
-        let Config::Server(server) = config else {
+        let ResolvedConfig::Server(server) = config else {
             continue;
         };
         let BindLocation::Address(addresses) = &server.bind_location else {
@@ -147,11 +261,14 @@ async fn prepare_tracking(
     }
     let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated.configs).collect();
     validated.refresh_catalog()?;
+    dns::check_interception(&validated.configs, &validated.dns_groups).await?;
+    let protect_tun_endpoints = config::protects_tun_endpoints(&validated.configs);
     let mut dns = dns::build_dns_registry_for_runtime(
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,
         previous,
         &synthetic_endpoints,
+        protect_tun_endpoints,
     )
     .await
     .map_err(|error| {
@@ -200,7 +317,7 @@ async fn prepare_tracking(
         .configs
         .iter()
         .filter_map(|config| {
-            let Config::TunServer(tun) = config else {
+            let ResolvedConfig::TunServer(tun) = config else {
                 return None;
             };
             let fd = tun.device_fd?;
@@ -208,6 +325,21 @@ async fn prepare_tracking(
         })
         .collect();
     Ok(PreparedServers {
+        ntp: crate::ntp::Prepared::new(
+            validated.ntp.clone(),
+            previous_servers.map(|previous| &previous.ntp),
+        ),
+        #[cfg(target_os = "linux")]
+        managed: network.ingress(),
+        cache_lease: cache_lease.clone(),
+        #[cfg(unix)]
+        remote_rules: crate::rule_updater::Refresh::new(
+            snapshot,
+            &validated.remote_rules,
+            memory,
+            previous_servers.map(|servers| &servers.remote_rules),
+            cache_lease,
+        )?,
         generation,
         certificates,
         validated,
@@ -222,6 +354,7 @@ async fn prepare_tracking(
 
 #[derive(Default)]
 struct RunningServers {
+    ntp: Option<crate::ntp::Running>,
     listeners: Vec<JoinHandle<()>>,
     #[cfg(unix)]
     tun: Vec<JoinHandle<io::Result<()>>>,
@@ -233,6 +366,23 @@ struct RunningServers {
 }
 
 impl RunningServers {
+    async fn shutdown_network(
+        &mut self,
+        registries: &[&PreparedServers],
+        network: &mut crate::desktop::NetworkSession,
+    ) -> io::Result<()> {
+        if let Some(ntp) = &mut self.ntp {
+            ntp.stop().await;
+        }
+        let network_result = network.deactivate().await;
+        let worker_result = self.shutdown(registries).await;
+        match (network_result, worker_result) {
+            (Ok(()), result) => result,
+            (Err(error), result) => Err(io::Error::other(format!(
+                "network cleanup failed: {error}; worker cleanup: {result:?}"
+            ))),
+        }
+    }
     async fn tun_failure(&mut self) -> io::Error {
         #[cfg(unix)]
         if !self.tun.is_empty() {
@@ -249,6 +399,7 @@ impl RunningServers {
 
     async fn shutdown(&mut self, registries: &[&PreparedServers]) -> io::Result<()> {
         self.stop().await;
+        self.ntp = None;
         let mut result = Ok(());
         for registry in registries {
             registry.certificates.stop().await;
@@ -263,6 +414,9 @@ impl RunningServers {
     }
 
     async fn stop(&mut self) {
+        if let Some(ntp) = &mut self.ntp {
+            ntp.stop().await;
+        }
         #[cfg(unix)]
         {
             for task in &self.tun {
@@ -285,8 +439,15 @@ impl RunningServers {
     }
 
     async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
-        prepared.certificates.bind_pending().await?;
         resources::configure(prepared.validated.global_limits)?;
+        // Synchronize before retryable binds, including deferred HTTP-01 listeners.
+        self.ntp = Some(
+            prepared
+                .ntp
+                .start(prepared.dns.forbidden_ranges().to_vec().into())
+                .await,
+        );
+        prepared.certificates.bind_pending().await?;
         self.reporter = Some(resources::ResourceReporter::start());
         self.dns_snapshots = Some(prepared.dns.snapshot_task());
         #[cfg(unix)]
@@ -300,13 +461,24 @@ impl RunningServers {
         }
         for config in &prepared.validated.configs {
             let dns_ref = match config {
-                Config::Server(server) => server.dns.as_ref(),
-                Config::TunServer(tun) => tun.dns.as_ref(),
-                _ => None,
+                ResolvedConfig::Server(server) => server.dns.as_ref(),
+                ResolvedConfig::TunServer(tun) => tun.dns.as_ref(),
             };
             let resolver = prepared.dns.get_for_server(dns_ref);
             #[cfg(unix)]
-            if let Config::TunServer(config) = config {
+            if let ResolvedConfig::TunServer(config) = config {
+                #[cfg(target_os = "linux")]
+                if config.auto_route {
+                    let ingress = prepared
+                        .managed
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("managed TUN ingress is missing"))?;
+                    let admission = crate::desktop::Ingress::tcp_admission(config);
+                    ingress
+                        .start(config, resolver, admission, &mut self.tun)
+                        .await?;
+                    continue;
+                }
                 if let Some(fd) = config.device_fd {
                     use std::os::fd::FromRawFd;
                     if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -353,21 +525,25 @@ impl RunningServers {
     }
 
     async fn start_retry(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        // Initial synchronization must not consume the listener rebind budget.
+        let mut deadline = None;
         loop {
-            match self.start(prepared).await {
+            let error = match self.start(prepared).await {
                 Ok(()) => return Ok(()),
-                Err(error) => {
-                    self.stop().await;
-                    if error.kind() != io::ErrorKind::AddrInUse
-                        || tokio::time::Instant::now() >= deadline
-                    {
-                        return Err(error);
-                    }
-                    self.quic_retirements.wait().await?;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                Err(error) => error,
+            };
+            self.stop().await;
+            if error.kind() != io::ErrorKind::AddrInUse {
+                return Err(error);
             }
+            let now = tokio::time::Instant::now();
+            let retry_deadline = *deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(3));
+            if now >= retry_deadline {
+                return Err(error);
+            }
+            self.quic_retirements.wait().await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -431,12 +607,15 @@ impl Drop for RunningServers {
 }
 
 struct ConfigWatches {
+    cache_dir: Option<PathBuf>,
     configs: Vec<PathBuf>,
     active: Vec<PathBuf>,
     candidate: Vec<PathBuf>,
     recovery: Vec<PathBuf>,
     watcher: Option<RecommendedWatcher>,
     recovery_watcher: Option<RecommendedWatcher>,
+    events: crate::file_watcher::EventFilter,
+    recovery_events: crate::file_watcher::EventFilter,
     tx: mpsc::Sender<()>,
     recovery_tx: mpsc::Sender<()>,
     recovery_changes: mpsc::Receiver<()>,
@@ -447,12 +626,15 @@ impl ConfigWatches {
     fn new(paths: &[String], tx: mpsc::Sender<()>, disabled: bool) -> io::Result<Self> {
         let (recovery_tx, recovery_changes) = mpsc::channel(1);
         let mut state = Self {
+            cache_dir: None,
             configs: paths.iter().map(PathBuf::from).collect(),
             active: Vec::new(),
             candidate: Vec::new(),
             recovery: Vec::new(),
             watcher: None,
             recovery_watcher: None,
+            events: crate::file_watcher::EventFilter::default(),
+            recovery_events: crate::file_watcher::EventFilter::default(),
             tx,
             recovery_tx,
             recovery_changes,
@@ -471,17 +653,28 @@ impl ConfigWatches {
                 .chain(&self.candidate)
                 .collect();
             // Construct the replacement before dropping the old watches.
-            self.watcher = Some(watch(&paths, self.tx.clone())?);
+            self.watcher = Some(crate::file_watcher::watch_excluding(
+                &paths,
+                self.tx.clone(),
+                self.cache_dir.as_deref(),
+                cfg!(target_os = "macos").then_some(&self.events),
+            )?);
             self.recovery_watcher = if self.recovery.is_empty() {
                 None
             } else {
-                Some(watch(&self.recovery, self.recovery_tx.clone())?)
+                Some(crate::file_watcher::watch_excluding(
+                    &self.recovery,
+                    self.recovery_tx.clone(),
+                    self.cache_dir.as_deref(),
+                    cfg!(target_os = "macos").then_some(&self.recovery_events),
+                )?)
             };
         }
         Ok(())
     }
 
-    fn discovered(&mut self, paths: &[PathBuf], recovery: &[PathBuf]) {
+    fn discovered(&mut self, paths: &[PathBuf], recovery: &[PathBuf], cache_dir: Option<&Path>) {
+        self.cache_dir = cache_dir.map(Path::to_path_buf);
         self.candidate = paths.to_vec();
         self.recovery = recovery.to_vec();
         if let Err(error) = self.refresh() {
@@ -497,6 +690,7 @@ impl ConfigWatches {
         // Late callbacks and queued identity-only events belong to the candidate,
         // not the active generation. Preserve the separate config/reload queue.
         (self.recovery_tx, self.recovery_changes) = mpsc::channel(1);
+        self.recovery_events = crate::file_watcher::EventFilter::default();
         if let Err(error) = self.refresh() {
             log::warn!("Could not refresh config dependency watches: {error}");
         }
@@ -581,9 +775,28 @@ impl ReloadSignal {
 }
 
 pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Result<()> {
+    if dry_run {
+        let configs = config::load_config_files(&paths).await?;
+        validate_configs(&paths, configs, &mut |_, _, _| {}).await?;
+        println!("Configuration valid");
+        return Ok(());
+    }
+    let mut shutdown = ShutdownSignals::new()?;
+    let mut reload = ReloadSignal::new()?;
+    let mut network = crate::desktop::NetworkSession::default();
     let mut control = None;
     let mut api = None;
-    let result = run_inner(paths, dry_run, no_reload, &mut control, &mut api).await;
+    let result = run_inner(
+        paths,
+        no_reload,
+        &mut control,
+        &mut api,
+        &mut network,
+        &mut shutdown,
+        &mut reload,
+    )
+    .await;
+    let cleanup = network.close().await;
     if let Some(api) = &mut api {
         api.shutdown().await;
     }
@@ -592,32 +805,44 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         control.shutdown().await;
     }
     drop(control);
-    result
+    match (result, cleanup) {
+        (result, Ok(())) => result,
+        (result, Err(error)) => Err(io::Error::other(format!(
+            "managed TUN cleanup failed: {error}; process: {result:?}"
+        ))),
+    }
 }
 
 async fn run_inner(
     paths: Vec<String>,
-    dry_run: bool,
     no_reload: bool,
     control: &mut Option<crate::control::runtime::ControlService>,
     api: &mut Option<crate::clash_api::ApiService>,
+    network: &mut crate::desktop::NetworkSession,
+    shutdown: &mut ShutdownSignals,
+    reload: &mut ReloadSignal,
 ) -> io::Result<()> {
-    if dry_run {
-        load_validated(&paths, &mut |_, _| {}).await?;
-        println!("Configuration valid");
-        return Ok(());
-    }
-    let mut shutdown = ShutdownSignals::new()?;
-    let mut reload = ReloadSignal::new()?;
     let (change_tx, mut changes) = mpsc::channel(1);
     let mut watches = ConfigWatches::new(&paths, change_tx, no_reload)?;
-    let mut discovered =
-        |paths: &[PathBuf], recovery: &[PathBuf]| watches.discovered(paths, recovery);
+    let configs = tokio::select! {
+        biased;
+        _ = shutdown.recv() => return Ok(()),
+        result = config::load_config_files(&paths) => result?,
+    };
+    *network = crate::desktop::NetworkSession::prepare(&configs).await?;
+    let mut discovered = |paths: &[PathBuf], recovery: &[PathBuf], root: Option<&Path>| {
+        watches.discovered(paths, recovery, root)
+    };
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare_tracking(&paths, None, None, &mut discovered, control) => result?,
+        result = prepare_tracking(&paths, configs, None, None, &mut discovered, control, network) => result?,
     };
+    network.prepare_network().await?;
+    #[cfg(target_os = "linux")]
+    {
+        prepared.managed = network.ingress();
+    }
     prepared.tcp =
         TcpListeners::prepare(&prepared.validated.configs, &TcpListeners::default(), &[])?;
     watches.activated(&prepared.validated.reload_files);
@@ -631,35 +856,69 @@ async fn run_inner(
     }
     tokio::select! {
         biased;
-        _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
+        _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
         result = running.start(&mut prepared) => if let Err(error) = result {
-            let _ = running.shutdown(&[&prepared]).await;
+            let _ = running.shutdown_network(&[&prepared], network).await;
             return Err(error);
         },
     }
-    if let Some(control) = control.as_ref() {
-        control.runtime.resume().await?;
+    if let Some(control) = control.as_ref()
+        && let Err(error) = control.runtime.resume().await
+    {
+        let cleanup = running.shutdown_network(&[&prepared], network).await;
+        return Err(io::Error::other(format!(
+            "controller activation failed: {error}; shutdown: {cleanup:?}"
+        )));
     }
     prepared.certificates.start().await;
     prepared.tcp.activate();
+    if let Err(error) = network.activate().await {
+        let cleanup = running.shutdown_network(&[&prepared], network).await;
+        return Err(io::Error::other(format!(
+            "managed network activation failed: {error}; shutdown: {cleanup:?}"
+        )));
+    }
     println!("Servers ready");
     loop {
-        let debounce = tokio::select! {
-            biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
-            error = running.tun_failure() => {
-                let _ = running.shutdown(&[&prepared]).await;
-                return Err(error);
+        enum Change {
+            Shutdown,
+            TunFailure(io::Error),
+            Reload { debounce: bool },
+        }
+        let change = wait_with_reconciliation(
+            async {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => Change::Shutdown,
+                    error = running.tun_failure() => Change::TunFailure(error),
+                    _ = reload.recv() => Change::Reload { debounce: false },
+                    _ = remote_rule_change(&mut prepared) => Change::Reload { debounce: false },
+                    _ = watches.changed(&mut changes) => Change::Reload { debounce: true },
+                }
             },
-            _ = reload.recv() => false,
-            _ = watches.changed(&mut changes) => true,
+            network,
+        )
+        .await;
+        let debounce = match change {
+            Ok(Change::Shutdown) => return running.shutdown_network(&[&prepared], network).await,
+            Ok(Change::TunFailure(error)) => {
+                let _ = running.shutdown_network(&[&prepared], network).await;
+                return Err(error);
+            }
+            Ok(Change::Reload { debounce }) => debounce,
+            Err(error) => {
+                let cleanup = running.shutdown_network(&[&prepared], network).await;
+                return Err(io::Error::other(format!(
+                    "managed network changed: {error}; shutdown: {cleanup:?}"
+                )));
+            }
         };
         if debounce {
             tokio::select! {
                 biased;
-                _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
+                _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
                 error = running.tun_failure() => {
-                    let _ = running.shutdown(&[&prepared]).await;
+                    let _ = running.shutdown_network(&[&prepared], network).await;
                     return Err(error);
                 },
                 _ = reload.recv() => {}
@@ -672,16 +931,20 @@ async fn run_inner(
         if let Err(error) = watches.refresh() {
             log::warn!("Could not refresh config watches: {error}");
         }
-        let mut discovered =
-            |paths: &[PathBuf], recovery: &[PathBuf]| watches.discovered(paths, recovery);
+        let mut discovered = |paths: &[PathBuf], recovery: &[PathBuf], root: Option<&Path>| {
+            watches.discovered(paths, recovery, root)
+        };
         let candidate = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
+            _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
             error = running.tun_failure() => {
-                let _ = running.shutdown(&[&prepared]).await;
+                let _ = running.shutdown_network(&[&prepared], network).await;
                 return Err(error);
             },
-            result = prepare_tracking(&paths, Some(&prepared.dns), Some(&prepared), &mut discovered, control) => result,
+            result = async {
+                let configs = config::load_config_files(&paths).await?;
+                prepare_tracking(&paths, configs, Some(&prepared.dns), Some(&prepared), &mut discovered, control, network).await
+            } => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -721,25 +984,27 @@ async fn run_inner(
         };
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
+            _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
             result = retirement => if let Err(error) = result {
-                let _ = running.shutdown(&[&prepared, &candidate]).await;
+                let _ = running.shutdown_network(&[&prepared, &candidate], network).await;
                 return Err(error);
             },
         }
         let result = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
+            _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
             result = running.activate(&mut candidate, control.as_ref()) => result,
         };
         if let Err(error) = result {
             let rollback = tokio::select! {
                 biased;
-                _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
+                _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
                 result = running.rollback(&mut prepared, &mut candidate, control.as_ref()) => result,
             };
             if let Err(rollback) = rollback {
-                let cleanup = running.shutdown(&[&prepared, &candidate]).await;
+                let cleanup = running
+                    .shutdown_network(&[&prepared, &candidate], network)
+                    .await;
                 return Err(io::Error::other(format!(
                     "Reload activation failed: {error}; rollback failed: {rollback}; shutdown: {cleanup:?}"
                 )));
@@ -751,6 +1016,36 @@ async fn run_inner(
         let mut retired = std::mem::replace(&mut prepared, candidate);
         retired.certificates.shutdown().await;
         println!("Servers ready");
+    }
+}
+
+async fn wait_with_reconciliation<T>(
+    change: impl std::future::Future<Output = T>,
+    network: &mut crate::desktop::NetworkSession,
+) -> io::Result<T> {
+    tokio::pin!(change);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut change => return Ok(result),
+            _ = network.changed() => {
+                // Retain in-flight refreshes and finish network mutations before handling reload/shutdown.
+                network.reconcile().await?;
+            }
+        }
+    }
+}
+
+async fn remote_rule_change(prepared: &mut PreparedServers) {
+    #[cfg(unix)]
+    prepared
+        .remote_rules
+        .changed(&prepared.dns, prepared.validated.global_limits)
+        .await;
+    #[cfg(not(unix))]
+    {
+        let _ = prepared;
+        std::future::pending::<()>().await;
     }
 }
 

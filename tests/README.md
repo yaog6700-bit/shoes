@@ -31,6 +31,41 @@ Android or iOS VPN service.
 Clippy's `--all-features` compiles optional tests but does not execute them.
 Likewise, a filtered `cargo test` command that matches zero tests succeeds; check
 the reported test count when renaming modules or changing CI filters.
+The nonzero-test guard checks the aggregate output. Independently required
+targets or filters need separate guarded invocations so one cannot mask another.
+
+Tests that relaunch themselves should use `shoes_test_support::isolated::run_isolated`,
+which requires exactly one passing child test, not just exit status zero. Custom
+namespace or environment launchers can use `assert_one_test_passed` on their
+captured output. Empty-filter and failed-child regressions exercise the guard.
+
+`test_local_server` and `test_local_server_streaming` reject HTTP error responses. Use
+`test_http_with_options` for intentional error-status assertions, and
+`test_local_server_streaming_verified` for bulk-transfer correctness rather than
+the output-discarding throughput helper.
+The curl POST helper kills and reaps its child on stdin write/flush failure;
+the Linux regression uses an isolated fake curl and verifies both `BrokenPipe`
+and cleanup. Dropping a pending curl request now requests termination of its direct
+child through Tokio's process ownership. Cancellation tests cover output waiting
+and a POST body larger than the measured stdin pipe capacity. Reaping after
+cancellation is best effort, not a synchronous barrier; override scripts must
+`exec` their payload rather than leave descendants outside that ownership.
+
+The unit-test CI job also builds the [pinned AnyTLS reference peer](fixtures/anytls-peer/README.md)
+and explicitly runs its ignored TCP/UoT pooling test. UoT packets are decoded by
+the reference library and delivered to a real loopback UDP endpoint, which checks
+message boundaries and transforms replies. This prevents a symmetric framing bug
+from passing through a byte-stream echo. Ordinary library runs do not require Go
+or an external peer binary.
+
+The shared VLESS/connected-UoT message adapter has focused tests under
+`src/vless/vless_message_stream/tests.rs`: split headers/bodies, truncated EOF,
+coalesced messages, small output-buffer retries, maximum/rejected frame sizes,
+and cancellation under backpressure followed by shutdown flushing. Run them with:
+
+```sh
+cargo test --locked --lib vless::vless_message_stream::tests::
+```
 
 ## Integration Targets
 
@@ -44,6 +79,7 @@ the reported test count when renaming modules or changing CI filters.
 | `rule_properties` | None | Bounded deterministic rule parser mutations and cross-format properties; no peers or network. |
 | `optional_peer` | `optional-peer-tests` | sing-box, Mihomo, Xray, shadowsocks-rust, and Naive Caddy as required by each case. Includes carrier sharing and idle reuse. |
 | `xhttp_interop` | `integration-tests` | Local-only filters or pinned Xray and Mihomo; see [XHTTP.md](XHTTP.md). |
+| `ws_early_data` | `integration-tests` | Local WS/WSS TCP/UDP, split prefixes, automatic standard-header reception with omitted/zero server limits, remaining VLESS carrier mismatches, and SOCKS chaining. `optional-peer-tests` also runs sing-box, Xray, and Mihomo in both directions and against default Shoes servers, with plaintext carrier captures. Linux CI runs the full target in the optional-peer job; macOS runs the local-only target and focused unit/configuration tests. |
 | `reality_interop` | `optional-peer-tests` | Pinned Xray and local TLS camouflage endpoints. |
 | `vless_encryption_interop` | `optional-peer-tests` | Pinned Xray, Mihomo, and sing-box; see the [fixture guide](fixtures/vless_encryption/README.md). |
 | `external_network` | `external-network-tests` | Internet access and sing-box for DNS, external REALITY, and proxy cases. |
@@ -78,7 +114,32 @@ The dedicated VLESS/REALITY fixtures additionally use `XRAY_BINARY` and
 `MIHOMO_BINARY`; their fixture guide and workflow specify the exact pins.
 Requested but unavailable peers should fail, not silently skip.
 
-The SS2022 identity tests use Xray 26.10.21, shadowsocks-rust `ssserver` 1.25.0,
+The WebSocket early-data suite requires sing-box 1.14.3 or newer because older
+clients discard bytes read ahead during the HTTP upgrade. CI pins 1.14.3 only
+for `ws_early_data`; the other suites retain their existing peer versions.
+Mihomo uses the optional-peer job's existing 1.19.31 pin: all three client
+carriers, standard-header server reception, and default Shoes server reception.
+
+Run the focused early-data, framing, configuration-validation, and factory tests with:
+
+```sh
+cargo test --locked --lib -- websocket:: config::validate::tests::websocket_early_data_
+```
+
+These cover parser boundaries, explicit limits above the automatic cap,
+routing before decoding, and independently
+scheduled reader/writer success, failure, cancellation, and timeout paths.
+Plaintext integration captures compare the exact Shoes VLESS first-flight prefix,
+including its configured split point. Peer captures allow different write batching.
+WSS cases verify end-to-end delivery, not decrypted carrier contents.
+
+The oversized AnyTLS padding test pins sing-box 1.15.0-alpha.13 through
+`SHOES_TEST_ANYTLS_SING_BOX_BIN`; locally it falls back to the normal sing-box
+selection. The 1.14 releases require authentication padding to fit in their first
+read and cannot handle this fixture's 40,000-byte auth padding. Other sing-box
+peer tests retain their existing pins.
+
+The SS2022 identity tests use Xray 26.10.31, shadowsocks-rust `ssserver` 1.25.0,
 and sing-box 1.14.1 with multi-user Shadowsocks and SagerNet UoT. They cover
 both AES key sizes, concurrent users, ordered relays, wrong/missing/reordered
 identity rejection, large bidirectional transfers, half-close, server-first data,
@@ -167,6 +228,10 @@ jobs cross-compile the native libraries but do not exercise device VPN lifecycle
 Only selected bounded stress cases run in CI; long-duration and performance tests
 remain explicit opt-ins. Filtered test steps run through
 `.github/require-tests.sh`, which fails a step whose filter selects no tests.
+The local-protocol job explicitly selects the bounded
+`vless_xudp_long_lived::test_content_integrity_varying_sizes` case from the stress
+target; its sustained and burst siblings remain manual. The selected case has a
+whole-test deadline as well as per-reply deadlines.
 
 Retain the existing suite boundaries. Prefer deterministic in-process tests for
 fragmentation, cancellation, credit accounting, and parser rejection; use

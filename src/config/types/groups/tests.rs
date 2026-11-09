@@ -53,8 +53,8 @@ fn test_client_config_group() {
         group_type: Default::default(),
         default: None,
         client_group: "test-client-group".to_string(),
-        client_proxies: OneOrSome::Some(vec![
-            ConfigSelection::Config(create_test_client_config()),
+        client_chains: OneOrSome::Some(vec![
+            ConfigSelection::Config(create_test_client_config()).into(),
             ConfigSelection::Config(ClientConfig {
                 name: None,
                 control: None,
@@ -69,7 +69,8 @@ fn test_client_config_group() {
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
-            }),
+            })
+            .into(),
         ]),
     })];
 
@@ -81,7 +82,7 @@ fn test_client_config_group() {
         panic!("Expected client config group");
     };
     assert_eq!(group.client_group, "test-client-group");
-    match &group.client_proxies {
+    match &group.client_chains {
         OneOrSome::Some(vec) => assert_eq!(vec.len(), 2),
         OneOrSome::One(_) => panic!("Expected Some(vec), got One"),
     }
@@ -91,88 +92,324 @@ fn test_client_config_group() {
 fn test_client_config_group_with_group_refs() {
     let yaml = r#"
 client_group: all-proxies
-client_proxies:
-  - us-proxies
-  - eu-proxies
+client_chains:
+  - chain: [us-proxies]
+  - chain: [eu-proxies]
 "#;
     let group: ClientConfigGroup = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(group.client_group, "all-proxies");
-    let proxies: Vec<_> = group.client_proxies.into_vec();
+    let proxies: Vec<_> = group.client_chains.into_vec();
     assert_eq!(proxies.len(), 2);
-    assert!(matches!(&proxies[0], ConfigSelection::GroupName(n) if n == "us-proxies"));
-    assert!(matches!(&proxies[1], ConfigSelection::GroupName(n) if n == "eu-proxies"));
+    assert!(
+        matches!(&proxies[0], super::ClientGroupMember::Client(ConfigSelection::GroupName(n)) if n == "us-proxies")
+    );
+    assert!(
+        matches!(&proxies[1], super::ClientGroupMember::Client(ConfigSelection::GroupName(n)) if n == "eu-proxies")
+    );
 }
 
 #[test]
 fn test_client_config_group_mixed() {
     let yaml = r#"
 client_group: mixed-group
-client_proxies:
-  - other-group
-  - address: "127.0.0.1:1080"
-    protocol:
-      type: direct
+client_chains:
+  - chain: [other-group]
+  - chain:
+      - address: "127.0.0.1:1080"
+        protocol:
+          type: direct
 "#;
     let group: ClientConfigGroup = serde_yaml::from_str(yaml).unwrap();
-    let proxies: Vec<_> = group.client_proxies.into_vec();
+    let proxies: Vec<_> = group.client_chains.into_vec();
     assert_eq!(proxies.len(), 2);
-    assert!(matches!(&proxies[0], ConfigSelection::GroupName(_)));
-    assert!(matches!(&proxies[1], ConfigSelection::Config(_)));
+    assert!(matches!(
+        &proxies[0],
+        super::ClientGroupMember::Client(ConfigSelection::GroupName(_))
+    ));
+    assert!(matches!(
+        &proxies[1],
+        super::ClientGroupMember::Client(ConfigSelection::Config(_))
+    ));
 }
 
 #[test]
-fn rule_group_members_determine_kind_not_action_presence() {
+fn policy_and_source_groups_are_explicit_and_roundtrip() {
     for yaml in [
         "rule_group: policies\nrules: [{masks: example.com}]",
         "rule_group: policies\nrule: {mask: example.com, action: block}",
+        "rule_group: policies\nrules: [{conditions: {masks: example.com}, action: block}]",
     ] {
         let group: RuleConfigGroup = serde_yaml::from_str(yaml).unwrap();
-        let RuleGroupRules::Policies(_) = group.rules else {
-            panic!("expected policies")
-        };
+        assert!(group.rules.iter().next().is_some());
         let encoded = serde_yaml::to_string(&group).unwrap();
         let group: RuleConfigGroup = serde_yaml::from_str(&encoded).unwrap();
-        assert!(matches!(group.rules, RuleGroupRules::Policies(_)));
+        assert!(group.rules.iter().next().is_some());
     }
     for yaml in [
-        "rule_group: files\nrules: [a.srs, {path: b, format: srs}]",
-        "rule_group: files\nrule: a.srs",
-        "rule_group: files\nrule: [a.srs, {path: b, format: srs}]",
-        "rule_group: files\nrules: {path: a.txt, behavior: domain}",
+        "rule_source_group: files\nrules: [a.srs, {path: b, format: srs}]",
+        "rule_source_group: files\nrule: a.srs",
+        "rule_source_group: files\nrule: [{domain: [example.com]}, {path: b, format: srs}]",
+        "rule_source_group: files\nrules: {all: [{domain_suffix: [example.com]}, {destination_port: [443]}]}",
+        "rule_source_group: files\nrules: [a.srs, {masks: example.com}]",
+        "rule_source_group: files\nrules: [{rule_source_group: other}]",
     ] {
-        let group: RuleConfigGroup = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(group.rules, RuleGroupRules::Sources(_)));
+        let group: RuleSourceGroup = serde_yaml::from_str(yaml).unwrap();
+        assert!(!group.rules.is_empty());
         let encoded = serde_yaml::to_string(&group).unwrap();
-        let group: RuleConfigGroup = serde_yaml::from_str(&encoded).unwrap();
-        assert!(matches!(group.rules, RuleGroupRules::Sources(_)));
+        let group: RuleSourceGroup = serde_yaml::from_str(&encoded).unwrap();
+        assert!(!group.rules.is_empty());
     }
     for (rules, error) in [
         ("[]", "cannot be empty"),
-        ("[a.srs, {masks: example.com}]", "cannot mix"),
-        ("[{masks: example.com}, {path: a.srs}]", "cannot mix"),
+        (
+            "[a.srs, {conditions: example.com}]",
+            "unknown rule predicate",
+        ),
+        (
+            "[{domain: [example.com], action: block}]",
+            "exactly one predicate",
+        ),
         ("[{path: a.srs, action: block}]", "unknown field `action`"),
         ("[{path: a.srs, fromat: srs}]", "unknown field `fromat`"),
-        ("[{rule_group: other}]", "unknown field `rule_group`"),
+        ("[{rule_group: other}]", "use {rule_source_group: name}"),
     ] {
-        let result =
-            serde_yaml::from_str::<RuleConfigGroup>(&format!("rule_group: x\nrules: {rules}"));
+        let result = serde_yaml::from_str::<RuleSourceGroup>(&format!(
+            "rule_source_group: x\nrules: {rules}"
+        ));
         assert!(result.unwrap_err().to_string().contains(error), "{rules}");
     }
     let error = serde_yaml::from_str::<Config>("rule_set: old\npath: a.srs").unwrap_err();
-    assert!(error.to_string().contains("replaced by rule_group"));
+    assert!(error.to_string().contains("replaced by rule_source_group"));
+}
+
+#[test]
+fn source_group_mask_leaf_round_trips_without_becoming_a_file() {
+    use crate::rules::{Compiler, Outcome};
+
+    let group: RuleSourceGroup =
+        serde_yaml::from_str("rule_source_group: addresses\nrules: {masks: example.com}").unwrap();
+    let encoded = serde_json::to_value(&group).unwrap();
+    assert_eq!(
+        encoded["rules"][0],
+        serde_json::json!({"masks": "example.com"})
+    );
+    let group: RuleSourceGroup = serde_json::from_value(encoded).unwrap();
+    let predicate = Compiler::default()
+        .compile(group.rules.into_iter().next().unwrap())
+        .unwrap();
+    assert_eq!(
+        predicate.evaluate(Some("sub.example.com"), None, 443),
+        Outcome::Match
+    );
+    assert_eq!(
+        predicate.evaluate(Some("other.example"), None, 443),
+        Outcome::Miss
+    );
+}
+
+#[test]
+fn policy_group_errors_preserve_element_details_and_migration_guidance() {
+    for (rules, expected) in [
+        (
+            "[{masks: example.com, acton: block}]",
+            "unknown field `acton`",
+        ),
+        (
+            "{masks: example.com, acton: block}",
+            "unknown field `acton`",
+        ),
+        ("[true]", "a policy rule requires a mapping"),
+        ("[]", "cannot be empty"),
+        (
+            "[a.srs]",
+            "action-free file sources moved to rule_source_group",
+        ),
+        (
+            "a.srs",
+            "action-free file sources moved to rule_source_group",
+        ),
+    ] {
+        let error =
+            serde_yaml::from_str::<Config>(&format!("rule_group: policies\nrules: {rules}"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(expected), "{rules}: {error}");
+    }
+    let group: RuleConfigGroup =
+        serde_yaml::from_str("rule_group: policies\nrules: [{path: a.srs}]").unwrap();
+    assert!(matches!(
+        group.rules.iter().next().unwrap().action,
+        RuleActionConfig::Allow { .. }
+    ));
+}
+
+#[test]
+fn chain_aliases_share_route_group_and_dns_sequence_semantics() {
+    use crate::config::DnsServerSpec;
+    use serde_json::{Value, json};
+
+    fn hops(chains: impl IntoIterator<Item = ClientChain>) -> Vec<Vec<Value>> {
+        chains
+            .into_iter()
+            .map(|chain| {
+                chain
+                    .hops
+                    .iter()
+                    .map(|hop| serde_json::to_value(hop).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    let inline =
+        json!({"name":"exit", "address":"proxy.invalid:1080", "protocol":{"type":"socks"}});
+    for field in ["client_chain", "client_chains"] {
+        for (value, lengths) in [
+            (json!("a"), vec![1]),
+            (inline.clone(), vec![1]),
+            (json!(["a", "b"]), vec![2]),
+            (json!(["a", inline.clone()]), vec![2]),
+            (json!({"chain":["a", "b"]}), vec![2]),
+            (json!({"chain":[{"pool":["a", "b"]}, "c"]}), vec![2]),
+            (json!([{"chain":["a"]}, {"chain":["b", "c"]}]), vec![1, 2]),
+            (json!([["a"], ["b", "c"]]), vec![1, 2]),
+            (json!(["a", {"chain":["b", "c"]}]), vec![1, 2]),
+        ] {
+            let rule_value = json!({"masks":"0.0.0.0/0", field:value});
+            let group_value = json!({"client_group":"out", field:value});
+            let dns_value = json!({"url":"tcp://192.0.2.1", field:value});
+            for yaml in [false, true] {
+                let parse_rule = || {
+                    if yaml {
+                        serde_yaml::from_str::<RuleConfig>(
+                            &serde_yaml::to_string(&rule_value).unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_value(rule_value.clone()).unwrap()
+                    }
+                };
+                let group: ClientConfigGroup = if yaml {
+                    serde_yaml::from_str(&serde_yaml::to_string(&group_value).unwrap()).unwrap()
+                } else {
+                    serde_json::from_value(group_value.clone()).unwrap()
+                };
+                let dns: DnsServerSpec = if yaml {
+                    serde_yaml::from_str(&serde_yaml::to_string(&dns_value).unwrap()).unwrap()
+                } else {
+                    serde_json::from_value(dns_value.clone()).unwrap()
+                };
+                let RuleActionConfig::Allow { client_chains, .. } = parse_rule().action else {
+                    panic!()
+                };
+                let expected = hops(client_chains.into_vec());
+                assert_eq!(
+                    expected.iter().map(Vec::len).collect::<Vec<_>>(),
+                    lengths,
+                    "{field}: {value}"
+                );
+                assert_eq!(
+                    hops(
+                        group
+                            .client_chains
+                            .iter()
+                            .cloned()
+                            .map(ClientGroupMember::into_chain)
+                    ),
+                    expected
+                );
+                assert_eq!(hops(dns.client_chains().iter().cloned()), expected);
+                let decoded: ClientConfigGroup =
+                    serde_json::from_value(serde_json::to_value(group).unwrap()).unwrap();
+                assert_eq!(
+                    hops(
+                        decoded
+                            .client_chains
+                            .into_vec()
+                            .into_iter()
+                            .map(ClientGroupMember::into_chain)
+                    ),
+                    expected
+                );
+                let decoded: DnsServerSpec =
+                    serde_yaml::from_str(&serde_yaml::to_string(&dns).unwrap()).unwrap();
+                assert_eq!(hops(decoded.client_chains().iter().cloned()), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn group_chain_fields_reject_duplicates_conflicts_and_empty_values() {
+    use serde_json::json;
+    for first in [
+        "client_chain",
+        "client_chains",
+        "client_proxy",
+        "client_proxies",
+    ] {
+        for second in [
+            "client_chain",
+            "client_chains",
+            "client_proxy",
+            "client_proxies",
+        ] {
+            let yaml = format!("client_group: out\n{first}: a\n{second}: b");
+            assert!(
+                serde_yaml::from_str::<ClientConfigGroup>(&yaml).is_err(),
+                "{yaml}"
+            );
+        }
+        for value in [json!(null), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<ClientConfigGroup>(
+                    json!({"client_group":"out", first:value})
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn owned_group_members_preserve_programmatic_chain_shapes() {
+    let selection = ConfigSelection::Config(create_test_client_config());
+    let single = ClientChainHop::Single(selection.clone());
+    let pool = ClientChainHop::Pool(OneOrSome::Some(vec![selection.clone(), selection.clone()]));
+    for hops in [
+        OneOrSome::One(single.clone()),
+        OneOrSome::Some(vec![single.clone()]),
+        OneOrSome::One(pool.clone()),
+        OneOrSome::Some(vec![pool, single]),
+    ] {
+        for name in [None, Some("named".to_owned())] {
+            let chain = ClientChain { hops: hops.clone() };
+            let expected = serde_json::to_value(&chain).unwrap();
+            let actual = ClientGroupMember::Chain { name, chain }.into_chain();
+            assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        }
+    }
+    for selection in [selection, ConfigSelection::GroupName("group".into())] {
+        let expected = serde_json::to_value(&selection).unwrap();
+        let chain = ClientGroupMember::Client(selection).into_chain();
+        let OneOrSome::One(ClientChainHop::Single(client)) = chain.hops else {
+            panic!("client members must remain single hops")
+        };
+        assert_eq!(serde_json::to_value(client).unwrap(), expected);
+    }
 }
 
 #[test]
 fn test_rule_config_group() {
     let original = vec![Config::RuleConfigGroup(RuleConfigGroup {
         rule_group: "test-rule-group".to_string(),
-        rules: RuleGroupRules::Policies(Box::new(OneOrSome::Some(vec![
+        rules: OneOrSome::Some(vec![
             create_test_rule_config(),
             RuleConfig {
                 criteria: Default::default(),
                 action: RuleActionConfig::Block,
             },
-        ]))),
+        ]),
     })];
 
     let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
@@ -183,10 +420,7 @@ fn test_rule_config_group() {
         panic!("Expected rule config group");
     };
     assert_eq!(group.rule_group, "test-rule-group");
-    let RuleGroupRules::Policies(rules) = &group.rules else {
-        panic!("Expected policies");
-    };
-    assert!(matches!(rules.as_ref(), OneOrSome::Some(values) if values.len() == 2));
+    assert!(matches!(&group.rules, OneOrSome::Some(values) if values.len() == 2));
 }
 
 #[test]
@@ -374,7 +608,7 @@ fn test_server_config_with_addresses_alias() {
 fn test_rejects_unknown_field_in_client_config_group() {
     let yaml = r#"
 - client_group: my-proxies
-  client_proxies:
+  client_chains:
     - address: "127.0.0.1:9090"
       protocol:
         type: socks

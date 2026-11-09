@@ -74,9 +74,10 @@ pub(super) fn client_tls(ca: Option<&Path>) -> io::Result<Arc<rustls::ClientConf
                 format!("ACME ca_cert '{}': {error}", path.display()),
             )
         })?;
-        config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
+        config = rustls::ClientConfig::builder_with_details(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            crate::clock::time_provider(),
+        )
         .with_safe_default_protocol_versions()
         .map_err(io::Error::other)?
         .with_root_certificates(roots)
@@ -241,10 +242,17 @@ impl instant_acme::HttpClient for HttpClient {
                     .host_str()
                     .ok_or_else(|| invalid("ACME URL has no host"))?
                     .trim_matches(['[', ']']);
-                let addresses =
-                    tokio::net::lookup_host((host, url.port_or_known_default().unwrap())).await?;
+                let location = crate::address::NetLocation::new(
+                    crate::address::Address::from(host)?,
+                    url.port_or_known_default().unwrap(),
+                );
+                let addresses = crate::resolver::Resolver::resolve_location(
+                    &crate::resolver::NativeResolver::new(),
+                    &location,
+                )
+                .await?;
                 let mut stream = None;
-                for address in addresses.take(8) {
+                for address in addresses.into_iter().take(8) {
                     let socket = crate::socket_util::new_tcp_socket(None, address.is_ipv6())?;
                     if let Ok(Ok(connected)) =
                         tokio::time::timeout(Duration::from_secs(5), socket.connect(address)).await

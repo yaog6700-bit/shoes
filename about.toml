@@ -89,3 +89,28 @@ license = "MIT"
 [[h3-quinn.clarify.files]]
 path = "../LICENSE"
 checksum = "a0d039cdafe68f363893abddb5e4d50dbe6f8b56611e2650aaab4237103285f1"
+
+# Preserves original netlink attributions, including the remaining modified licenses.
+[netlink-packet-core.clarify]
+license = "MIT"
+[[netlink-packet-core.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "964a53330f9cd970c1790311024281a994644f9b554ff6d37e233672287bf767"
+
+[netlink-proto.clarify]
+license = "MIT"
+[[netlink-proto.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "edf961a237711260d59dca3743f3664fdd8e296f120683800d55881aa4fd4aae"
+
+[netlink-sys.clarify]
+license = "MIT"
+[[netlink-sys.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "964a53330f9cd970c1790311024281a994644f9b554ff6d37e233672287bf767"
+
+[rtnetlink.clarify]
+license = "MIT"
+[[rtnetlink.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "8a05cb387a371123fa086e588abe594d15f7875fe065d61582ae7b25dbee9c11"

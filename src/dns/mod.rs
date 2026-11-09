@@ -10,16 +10,51 @@
 //! TCP-based protocols (tcp://, tls://, https://) support routing through
 //! proxy chains via the ProxyRuntimeProvider.
 
+#[cfg(target_os = "linux")]
+mod bootstrap;
 mod builder;
 mod composite_resolver;
+mod context;
 mod exchange;
 pub mod fake_ip;
 mod guard;
 mod hickory_resolver;
+mod hosts;
 mod message;
 mod parsed;
 mod proxy_runtime;
+mod stream;
 mod system;
+#[allow(
+    dead_code,
+    reason = "staged adapter; global tendns policy is not activated yet"
+)]
+mod tendns_resolver;
+
+#[cfg(target_os = "linux")]
+pub(crate) use bootstrap::controlled as controlled_bootstrap;
+pub(crate) use builder::check_interception;
+pub use context::{DnsContext, FakeDnsResolver};
+pub use hosts::StaticHosts;
+
+pub(crate) fn canonical_hostname(name: &str) -> Option<String> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() || name.len() > 253 || name.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    if !name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.as_bytes()[0].is_ascii_alphanumeric()
+            && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
 
 pub(crate) use guard::{SyntheticDnsAnswer, real_only};
 

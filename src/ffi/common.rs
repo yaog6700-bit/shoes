@@ -10,6 +10,7 @@ use log::info;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::config::ResolvedConfig;
 use crate::config::{Config, convert_cert_paths, load_config_str};
 use crate::dns::build_dns_registry_for_runtime;
 use crate::logging::{FILE_LOG_FLUSH_TIMEOUT, FileLogWriter, LogWriter};
@@ -215,14 +216,31 @@ pub fn is_service_running() -> bool {
 /// The config YAML must already have device_fd set in the TUN config.
 pub async fn start_from_config(
     config_yaml: &str,
-    shutdown_rx: oneshot::Receiver<()>,
+    mut shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     info!("Parsing config for TUN server");
 
     let config_yaml = config_yaml.to_owned();
-    let configs: Vec<Config> = tokio::task::spawn_blocking(move || load_config_str(&config_yaml))
-        .await
-        .map_err(std::io::Error::other)??;
+    let mut configs: Vec<Config> =
+        tokio::task::spawn_blocking(move || load_config_str(&config_yaml))
+            .await
+            .map_err(std::io::Error::other)??;
+
+    let mut remote_refresh = configs
+        .iter()
+        .any(|config| matches!(config, Config::GlobalSettings(settings) if settings.rule_cache_dir.is_some()));
+    if !remote_refresh {
+        crate::rule_set::visit_sources(&mut configs, &mut |source| {
+            remote_refresh |= source.parsed_url()?.is_some();
+            Ok(())
+        })?;
+    }
+    if remote_refresh {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remote rule refresh requires the process runtime and is not supported by FFI",
+        ));
+    }
 
     let (configs, pem_count) = convert_cert_paths(configs).await?;
     if pem_count > 0 {
@@ -231,6 +249,7 @@ pub async fn start_from_config(
 
     let mut validated = crate::config::compile_configs(configs).await?;
     validated.validate_ffi_support()?;
+    crate::dns::check_interception(&validated.configs, &validated.dns_groups).await?;
     let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
@@ -238,6 +257,7 @@ pub async fn start_from_config(
         configs: validated_configs,
         dns_groups,
         global_limits,
+        ntp,
         ..
     } = validated;
     crate::resources::configure(global_limits)?;
@@ -245,9 +265,17 @@ pub async fn start_from_config(
 
     // Build DNS registry from expanded groups
     let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated_configs).collect();
-    let mut dns_registry =
-        build_dns_registry_for_runtime(dns_groups, global_limits, None, &synthetic_endpoints)
-            .await?;
+    let protect_tun_endpoints = validated_configs.iter().any(
+        |config| matches!(config, ResolvedConfig::TunServer(tun) if tun.dns_hijack == Some(true)),
+    );
+    let mut dns_registry = build_dns_registry_for_runtime(
+        dns_groups,
+        global_limits,
+        None,
+        &synthetic_endpoints,
+        protect_tun_endpoints,
+    )
+    .await?;
     let dns_snapshots = dns_registry.snapshot_task();
 
     // Separate TUN config from server configs, validate exactly one TUN with device_fd
@@ -256,7 +284,7 @@ pub async fn start_from_config(
 
     for config in validated_configs {
         match config {
-            Config::TunServer(tc) => {
+            ResolvedConfig::TunServer(tc) => {
                 if tun_config.is_some() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -279,16 +307,22 @@ pub async fn start_from_config(
                 );
                 tun_config = Some(tc);
             }
-            Config::Server(sc) => {
+            ResolvedConfig::Server(sc) => {
                 server_configs.push(sc);
             }
-            _ => {}
         }
     }
 
     let tun_config = tun_config.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "No TUN config found")
     })?;
+
+    let prepared_ntp = crate::ntp::Prepared::new(ntp, None);
+    let mut ntp = tokio::select! {
+        biased;
+        _ = &mut shutdown_rx => return Ok(()),
+        running = prepared_ntp.start(dns_registry.forbidden_ranges().to_vec().into()) => running,
+    };
 
     #[cfg(unix)]
     let mut wireguard_running = crate::wireguard::Running::default();
@@ -297,6 +331,7 @@ pub async fn start_from_config(
         .start(&mut dns_registry, &mut wireguard_running)
         .await
     {
+        ntp.stop().await;
         wireguard_running.stop().await;
         if let Err(error) = dns_registry.shutdown_checkpoint().await {
             log::warn!("Final Fake DNS checkpoint failed: {error}");
@@ -309,9 +344,10 @@ pub async fn start_from_config(
 
     for server_config in server_configs {
         let resolver = dns_registry.get_for_server(server_config.dns.as_ref());
-        match start_servers(Config::Server(server_config), resolver).await {
+        match start_servers(ResolvedConfig::Server(server_config), resolver).await {
             Ok(tasks) => join_handles.0.extend(tasks),
             Err(error) => {
+                ntp.stop().await;
                 join_handles.stop().await;
                 #[cfg(unix)]
                 wireguard_running.stop().await;
@@ -337,6 +373,7 @@ pub async fn start_from_config(
     ));
 
     // Cleanup any servers when TUN stops
+    ntp.stop().await;
     join_handles.stop().await;
     certificates.shutdown().await;
     #[cfg(unix)]
@@ -361,6 +398,10 @@ mod wireguard_tests;
 mod rule_source_tests;
 
 #[cfg(all(test, unix))]
+#[path = "ntp_tests.rs"]
+mod ntp_tests;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
@@ -370,12 +411,47 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[tokio::test]
+    async fn removed_fallback_configuration_is_rejected_before_resources_open() {
+        let (_wire, tun) = UnixDatagram::pair().unwrap();
+        let flags = unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) };
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = serde_json::json!([
+            {"device_fd": tun.as_raw_fd()},
+            {"address": occupied.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+            {"client_group": "removed", "type": "fallback", "client_proxies": ["direct"]}
+        ]);
+        for check in [
+            None,
+            Some(serde_json::json!({
+                "url": "http://probe.invalid/", "interval_secs": 30
+            })),
+        ] {
+            let expected = if let Some(check) = check {
+                config[2]["health_check"] = check;
+                "unknown field `health_check`"
+            } else {
+                "unknown client group type: fallback"
+            };
+            let (_shutdown, shutdown) = oneshot::channel();
+            let error = start_from_config(&config.to_string(), shutdown)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) },
+                flags
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn url_test_configuration_is_rejected_without_a_process_supervisor() {
         let config = r#"
 - client_group: automatic
   type: url-test
   url: http://probe.invalid/
-  client_proxies: [direct]
+  client_chains: [direct]
 "#;
         let (_shutdown, shutdown) = oneshot::channel();
         let error = start_from_config(config, shutdown).await.unwrap_err();
@@ -425,16 +501,11 @@ mod tests {
     #[test]
     fn timed_out_service_cannot_clear_replacement_socket_protector() {
         if std::env::var_os("SHOES_FFI_RESTART_TEST_CHILD").is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "ffi::common::tests::timed_out_service_cannot_clear_replacement_socket_protector",
-                    "--nocapture",
-                ])
-                .env("SHOES_FFI_RESTART_TEST_CHILD", "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+            shoes_test_support::isolated::run_isolated(
+                "ffi::common::tests::timed_out_service_cannot_clear_replacement_socket_protector",
+                "SHOES_FFI_RESTART_TEST_CHILD",
+                "1",
+            );
             return;
         }
         let (_old_peer, old_fd) = UnixDatagram::pair().unwrap();
