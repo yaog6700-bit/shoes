@@ -66,6 +66,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set build version metadata
+        run: |
+          pkg_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "SHOES_RELEASE_TAG=v${pkg_ver}" >> "$GITHUB_ENV"
+          echo "SHOES_BUILD_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
@@ -99,11 +105,12 @@ jobs:
         run: |
           mkdir -p package artifacts
           cp "target/$TARGET/release/${{ matrix.binary_name }}" package/
+          if [ -f LICENSE ]; then cp LICENSE package/; fi
           if [ -f THIRD_PARTY_NOTICES.md ]; then cp THIRD_PARTY_NOTICES.md package/; fi
           if [ -d licenses ]; then cp -R licenses package/; fi
           if [[ "$TARGET" == *"windows"* ]]; then
             cd package
-            7z a "../artifacts/shoes-$TARGET.zip" "${{ matrix.binary_name }}" $([ -f THIRD_PARTY_NOTICES.md ] && echo THIRD_PARTY_NOTICES.md) $([ -d licenses ] && echo licenses)
+            7z a "../artifacts/shoes-$TARGET.zip" "${{ matrix.binary_name }}" $([ -f LICENSE ] && echo LICENSE) $([ -f THIRD_PARTY_NOTICES.md ] && echo THIRD_PARTY_NOTICES.md) $([ -d licenses ] && echo licenses)
           else
             tar -czf "artifacts/shoes-$TARGET.tar.gz" -C package .
           fi
@@ -150,9 +157,14 @@ jobs:
           if [ -n "${{ github.ref_name }}" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
             echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
-            git fetch --tags --force || true
-            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.3.6")
-            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            pkg_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+            if [ -n "$pkg_ver" ]; then
+              echo "tag=v${pkg_ver}" >> $GITHUB_OUTPUT
+            else
+              git fetch --tags --force || true
+              LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.3.7")
+              echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Create Release

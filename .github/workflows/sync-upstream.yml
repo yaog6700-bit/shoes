@@ -2,8 +2,9 @@ name: Sync Upstream & Auto Build
 
 on:
   schedule:
-    # 每天每 6 小时自动检查一次原项目是否有新版本
-    - cron: '0 */6 * * *'
+    # 错峰在每 2 小时的 23 分与每 3 小时的 53 分巡检，避开 GitHub 整点(0分)队列拥堵丢包
+    - cron: '23 */2 * * *'
+    - cron: '53 */3 * * *'
   workflow_dispatch: # 支持在 GitHub 网页手动点击一键检查同步
 
 permissions:
@@ -52,21 +53,26 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Backup custom workflow files before resetting to upstream tag
+          cp .github/workflows/build.yml "$RUNNER_TEMP/build.yml"
+          cp .github/workflows/sync-upstream.yml "$RUNNER_TEMP/sync-upstream.yml"
+
           git remote add upstream https://github.com/cfal/shoes.git || true
           git fetch upstream --tags --force
 
-          # Merge upstream master while protecting our custom workflow files
-          git checkout master
-          git merge upstream/master -m "chore: sync upstream $TARGET_TAG" || {
-            echo "Resolving merge conflicts by preserving our workflows..."
-            git checkout --ours .github/workflows/
-            git add .github/workflows/
-            git commit -m "chore: preserve custom workflows for $TARGET_TAG"
-          }
+          # Reset master cleanly to the exact upstream release tag commit (zero conflict risk)
+          git checkout -B master "refs/tags/$TARGET_TAG"
 
-          # Update the tag locally and push both master and the tag
+          # Restore custom workflow files on top of the upstream release
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/build.yml" .github/workflows/build.yml
+          cp "$RUNNER_TEMP/sync-upstream.yml" .github/workflows/sync-upstream.yml
+          git add .github/workflows/build.yml .github/workflows/sync-upstream.yml
+          git commit -m "ci: sync upstream $TARGET_TAG with Windows release workflows"
+
+          # Update the tag locally and force-push both master and the tag
           git tag -f "$TARGET_TAG"
-          git push origin master
+          git push -f origin master
           git push -f origin "$TARGET_TAG"
 
           echo "Triggering Build Binaries workflow for $TARGET_TAG..."
