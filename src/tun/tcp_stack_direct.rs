@@ -39,6 +39,7 @@ use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 use super::wake::{Wake, WakeReceiver};
 
 pub const PACKET_QUEUE_CAPACITY: usize = 64;
+const UDP_INGRESS_QUEUE_CAPACITY: usize = 128;
 
 /// Tracks socket info including addresses for proper cleanup.
 struct SocketInfo {
@@ -160,7 +161,7 @@ impl TcpStackDirect {
         admission: Option<Arc<tokio::sync::Semaphore>>,
     ) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
-        let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let (udp_tx, udp_rx) = mpsc::channel(UDP_INGRESS_QUEUE_CAPACITY);
         let (tcp_tx, tcp_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (completion_tx, completion) = oneshot::channel();
@@ -733,6 +734,19 @@ fn run_direct_stack_thread(
         }
     }
 
+    // Dropping a socket does not notify the application. Abort discards queued payload
+    // and lets smoltcp emit a best-effort reset while the retained TUN is still usable.
+    for handle in sockets.keys() {
+        socket_set.get_mut::<TcpSocket>(*handle).abort();
+    }
+    for _ in 0..MAX_EGRESS_SWEEPS {
+        if iface.poll_egress(stack_now(), &mut device, &mut socket_set)
+            == smoltcp::iface::PollResult::None
+            || device.tx_error.is_some()
+        {
+            break;
+        }
+    }
     info!("smoltcp direct stack thread stopped");
     Ok(())
 }

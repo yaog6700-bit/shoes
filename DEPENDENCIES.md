@@ -22,22 +22,87 @@ The workspace patches in `Cargo.toml` are required by checkout/release builds:
 - `cfal/hickory-dns`: connection-close recovery, healthy-upstream failover and
   bounded TCP/DoT receive progress.
 - `cfal/smoltcp`: TUN/WireGuard TCP retransmission ACK sequencing.
-- `mullvad/gotatun`: upstream's portable 64-bit atomics for targets without
-  native support, including MIPS32.
 
 Preserve each repository and full revision unless explicitly updating that fork.
 Check every resolved consumer, especially Quinn, tokio-rustls, hyper-rustls,
 rustls-platform-verifier, Hickory and Shoes; absence of unused-patch warnings is
 not sufficient. Keep `publish = false` while workspace patches remain.
 
+### BLAKE3
+
+The November 15 refresh retains package version **1.8.7**, also the latest
+non-yanked stable registry release at that date. The release is based on
+[`f3149ec5bb5449af877ba20377a11008ff499fa2`](https://github.com/BLAKE3-team/BLAKE3/releases/tag/1.8.7);
+the fork instead targets unreleased upstream master
+[`657284b1fa4c4378aa7422b4450dcb5c2c9052fc`](https://github.com/BLAKE3-team/BLAKE3/commit/657284b1fa4c4378aa7422b4450dcb5c2c9052fc).
+
+The source series was `derive-key-bytes-upstream-20261021`, at the previous Shoes
+pin `cd98c1c4112ed3b2cf2140e1844f266b3d665b53`, based on upstream
+`f55849f89cd85083c1c9daa2c5de20766f309c00`. Its one custom API commit is retained
+unchanged by the rebase. A separate test-only fix replaces allocated vectors
+with fixed arrays so the binary-context regression also compiles without `std`.
+The published candidate is
+[`5bd8a7ef060bac222502a449bb89b7bdcdb8ec09`](https://github.com/cfal/BLAKE3/tree/5bd8a7ef060bac222502a449bb89b7bdcdb8ec09)
+on `derive-key-bytes-upstream-20261115-1794700800046000`. Existing branches and
+tags remain intact, retaining old pins. The fork's default `master` does not
+carry the API; discover the published patch series before future refreshes.
+
+The only new upstream change replaces secret-indexed hexadecimal lookup with
+nibble arithmetic in `Hash::to_hex`, also used by `Display` and `Debug`.
+Lowercase output bytes are unchanged. Upstream describes this as
+"constant-ish" time, not a compiler-independent constant-time guarantee.
+Earlier stack-buffer alignment and AVX-512 zero-output soundness fixes remain
+included; neither is part of released 1.8.7. Release 1.8.7's removal of the
+compromised `arrayref` dependency was already included in the previous pin.
+Public APIs, features, dependencies, native build scripts, supported targets,
+SIMD dispatch and zeroization are unchanged. Upstream CI's Rust 1.85.1 build
+still works with a fresh MSRV-compatible dependency resolution; this does not
+make newer transitive releases compatible with that compiler. Shoes keeps its
+existing Rust floor and locked dependency versions.
+
+[Upstream PR #596](https://github.com/BLAKE3-team/BLAKE3/pull/596) remains unmerged.
+Retain the patch until a non-yanked registry release provides equivalent
+raw-byte derivation that passes these vectors.
+VLESS Encryption requires raw-byte contexts, including NUL and invalid UTF-8:
+`DERIVE_KEY_CONTEXT` hashes the context, then `DERIVE_KEY_MATERIAL` hashes the
+material using that context key. Text, hex, base64, lossy conversion and ordinary
+keyed hashing are not substitutes. Preserve equivalence with `derive_key` for
+valid UTF-8 and every Go-derived binary vector, including empty and multi-chunk
+contexts. No Shoes API adaptation or wire-format change is needed. Check all
+callers, including ordinary hashes in VLESS, NaiveProxy and rule updates, plus
+Shadowsocks' textual KDF and XOF-derived subkeys.
+
+Future updates must inspect the complete upstream delta and `range-diff`, then
+run the fork's current CI matrix, official vectors and binary-context regression
+in native/intrinsics/pure debug and release builds, including `no_std` and public
+features. Confirm actual SIMD support: this refresh's local x86_64 Linux tests
+executed SSE2, SSE4.1 and AVX2, but not AVX-512 or other architectures. Passing
+early-return tests are not hardware coverage. In Shoes, use the current pinned
+peer workflow, `binary_context_kdfs_match_go`, the VLESS Encryption fixtures,
+Shadowsocks and NaiveProxy tests. Verify the final published full SHA with
+`--locked`, inspect every resolved consumer, and regenerate dependency notices.
+
 ### GotaTun
 
-Pinned to upstream main at `c06582e41022bcecbf33751631fd5a63d5794dc5`, including
-[#221](https://github.com/mullvad/gotatun/pull/221). Published 0.10.2 lacks that
-fix despite sharing the package version. The git workspace also splits out
-`gotatun-crypto` and `gotatun-packet`; retain their matching source revision and
-the corresponding source links in `THIRD_PARTY_NOTICES.md`. Shoes keeps AWS-LC
-and uses its own conditional atomic imports on targets without 64-bit atomics.
+Published 0.10.3 replaces the upstream git patch. Its archive identifies
+[`c541472b40ec489ba7bdfd048512e89e556c7a3c`](https://github.com/mullvad/gotatun/tree/c541472b40ec489ba7bdfd048512e89e556c7a3c),
+not the different main-branch commit also declaring 0.10.3. Both session and
+cookie counters retain [#221](https://github.com/mullvad/gotatun/pull/221)'s
+conditional portable-atomic fallback. The published crate folds the git-only
+`gotatun-crypto` and `gotatun-packet` packages back into the main crate; Shoes'
+packet, transport and X25519 APIs remain compatible. AWS-LC and device features
+are unchanged, as are Shoes' own conditional atomic imports.
+
+The TAI64N base changes from `2^62 + 37` to wireguard-go's `2^62 + 10`.
+The same-key handoff regression keeps a reference responder alive across Shoes
+and wireguard-go initiators and requires success before the old 27-second
+timestamp lead could expire. Existing both-role/rekey tests alone cannot detect
+this difference. A recent old-version initiation can temporarily delay a fast
+upgrade against retained responder replay state.
+
+The published archive omits its repository-root license files. Corresponding
+source URLs use its VCS metadata; offline notice tests pin the verified upstream
+MPL and Cloudflare license hashes. Retain both bundled texts.
 
 ### Hickory
 
@@ -227,8 +292,9 @@ against non-yanked stable releases. The refresh advances Shoes' BLAKE2 requireme
 to 0.11 and rtnetlink to 0.24, and takes ML-KEM 0.3.4, log 0.4.35, mime 0.3.18, cc 1.11.0,
 crc32fast 1.5.4, ctutils 0.4.8, module-lattice 0.2.4, notify-types 2.2.0,
 netlink-packet-route 0.34, netlink-proto 0.14.1, utf8_iter 1.1/utf_types 1.0,
-and wasm-bindgen 0.2.130/js-sys 0.3.107. All protected cfal repositories and
-full revisions remain unchanged, including Hickory; the publishing guard remains.
+and wasm-bindgen 0.2.130/js-sys 0.3.107. That registry refresh left all protected
+cfal repositories and full revisions unchanged, including Hickory; subsequent
+fork refreshes are recorded above. The publishing guard remains.
 
 [ML-KEM 0.3.4](https://github.com/RustCrypto/KEMs/releases/tag/ml-kem%2Fv0.3.4)
 hardens secret-key formatting, comparisons, reduction and zeroization. Its XOF
@@ -274,6 +340,86 @@ registry storage-record permissions are unnecessary. Artifact names, inputs,
 architectures, credentials policy and peer baselines are unchanged.
 Rust 1.99.1, Go 1.27.3, cargo-about 0.9.3, cargo-ndk 4.1.2, cbindgen 0.29.4,
 cargo-llvm-cov 0.9.1 and cross 0.2.5 remain current.
+
+## November 16, 2026 Refresh
+
+All maintained cfal repositories, full revisions and matching rustls constraints
+remain unchanged. `Cargo.toml` is authoritative; earlier dated fork sections
+record historical maintenance evidence, not instructions to restore old pins.
+The graph must retain one intended rustls fork and the shared Shoes/Hickory
+h3/h3-quinn forks, alongside BLAKE3 and smoltcp.
+
+The lockfile advances GotaTun to published 0.10.3, rustls-pki-types to 1.16.0,
+rustls-webpki to 0.103.17, both Web PKI root packages to 1.0.12, notify to 8.2.2,
+notify-types to 2.3.1, prost/prost-derive to 0.14.6 and their newly permitted
+itertools to 0.15.0. Compatible updates also cover bumpalo, cc, const-oid,
+crc32fast, errno, flate2, itoa, libloading, mio, rand 0.10, smallvec, syn 3 and
+uuid. Existing wildcard and narrower version conventions are retained, except
+both workspace rand requirements and Shoes' rand_core requirement now specify
+0.10. The code requires `RngExt`; targeted resolution otherwise reassigned
+wildcard consumers to the separately required older families. Inspect consumer
+edges, not just package versions: bounded multi-major getrandom/windows-sys
+requirements also need their existing newest selections retained.
+
+Consequential changes and coverage:
+
+- TLS DNS names normalize a trailing dot and reject hexadecimal numeric final
+  labels. Captured-SNI handshakes retain certificate verification, disabled SNI,
+  nested TLS and XHTTP behavior; HTTP/TLS sniff tests preserve original bytes.
+- WebPKI rejects malformed/duplicate SCT extension wrappers, including in
+  signature verification when chain verification is disabled. No automatic CT
+  verification is enabled. Tests exercise server loading and verified,
+  fingerprint-only and unverified client handshakes. Root-removal tests retain
+  the prior emSign exclusions and cover all six newly removed anchors.
+- flate2 changes streaming flush/finalization and pending-output handling.
+  Shoes retains its low-level bounded decoder; regressions cover output-buffer
+  boundaries, sync flushes, truncation, concatenated streams and trailing data.
+- crc32fast adds runtime-detected AArch64 PMULL acceleration; cross-compilation
+  alone does not exercise it. Mio/notify primarily fix Windows I/O completion
+  and cancellation lifetimes; Windows runtime coverage remains unavailable.
+- bumpalo 3.20.4 fixes concurrent zero-sized-allocation undefined behavior
+  ([GHSA-j7wg-xg3h-2pr6](https://github.com/fitzgen/bumpalo/security/advisories/GHSA-j7wg-xg3h-2pr6)).
+  A RustSec snapshot predating that advisory is not evidence of its absence.
+
+Published nix 0.32.0 contains #2821, but GotaTun, tun and rtnetlink still require
+0.31. The unchanged git pin and registry 0.32.0 pass isolated iOS checks using
+Shoes' actual socket/net/fs/ioctl/time/uio/user features; registry 0.31.3 fails
+with missing Apple-only symbols. Retain the patch rather than editing parents,
+adding a second major, or substituting the broken registry 0.31.3. Parking_lot
+0.13/core 0.10 still probes futex_time64 before falling back on ENOSYS, which
+does not handle Android 26-29 seccomp traps; retain 0.12.5 and the API 21 floor.
+Other parent-constrained RustCrypto/rand/windows families and prereleases are
+not forcibly upgraded. Crypto-common 0.1.7 requires generic-array exactly 0.14.7;
+the newer unyanked 0.14.9 cannot replace it without changing that parent.
+AWS-LC, Quinn, Tokio, rcgen, instant-acme, tun, tendns,
+ML-KEM and the other eligible direct Rust dependencies are already current.
+
+Release builds advance to Rust 1.100.0, with matching sysroot notices; the
+separate MSRV check remains 1.99.1. Docker retains Bookworm in both stages.
+OpenWrt 25.12.6 supplies GCC 14.3.0 and unchanged musl 1.2.5, big-endian MIPS32r2
+o32 soft-float ABI and static libraries. Preserve the existing GCC unwinder shim,
+ELF static-link assertions and 24Kc QEMU smoke check. Its Linux 6.12 headers do
+not establish a Shoes runtime minimum. Go advances to 1.27.4 for active peer
+builds, not frozen fixture provenance. Node 26 resolves to 26.13.1. Cargo-about
+0.9.3, cargo-ndk 4.1.2, cbindgen 0.29.4, cargo-llvm-cov 0.9.1 and cross 0.2.5
+remain latest stable. Release Actions are already current; the rust-toolchain
+SHA advances without runtime implementation changes. Permissions, action
+inputs, caches, artifact contracts and pinned interoperability peers are retained.
+
+Documentation advances to Astro 7.4.12 and Starlight 0.43.1. Explicit
+`scopedStyleStrategy: 'where'` preserves the previous CSS specificity after
+Starlight stops forcing that strategy. Compatible transitive updates and
+their parent constraints are checked separately from direct dependency pins.
+The language-icon check follows Starlight's new wrapper element and additionally
+checks selected locales and theme choices; mobile icon styling remains intact.
+Sitemap 10 retains Astro's stream API; checks require complete canonical URL
+coverage, locale alternates and exclusion of error pages. Astro and its extracted
+Vite plugin now require rolldown `~1.2.16`, while Vite requires `~1.2.18`:
+the single 1.2.19 copy replaces root 1.3.0 plus nested 1.2.16 intentionally.
+Its exact oxc-types 0.156 requirement explains that apparent downgrade too.
+Starlight retains satteri 0.10.5 alongside Astro's 0.11.7; newer incompatible
+transitives are not forced through overrides. i18next 27's changed defaults are
+mediated by Starlight's explicit fallback locale and filtered dictionaries.
 
 ## Validation
 

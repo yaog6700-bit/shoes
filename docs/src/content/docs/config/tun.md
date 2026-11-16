@@ -38,7 +38,7 @@ limits are unlimited; a specified admission limit must be positive.
 
 | Field | Default | Constraint |
 | --- | --- | --- |
-| `tcp_buffer_size` | 32,768 bytes | 1,024-16,777,216 bytes |
+| `tcp_buffer_size` | 131,072 bytes (128 KiB) | 1,024-16,777,216 bytes |
 | `tcp_memory_bytes` | Unlimited | At least four times `tcp_buffer_size` |
 | `max_tcp_connections` | Unlimited | Positive integer |
 | `max_udp_sessions` | Unlimited | Positive integer |
@@ -46,9 +46,32 @@ limits are unlimited; a specified admission limit must be positive.
 | `max_udp_destinations_per_session` | Unlimited | Positive integer |
 | `max_udp_queued_bytes` | Unlimited | At least 65,535 bytes |
 
+Each TCP flow in the TUN stack has four buffers, totaling 512 KiB of capacity at the
+default size, plus other connection overhead. Without admission caps, total
+buffer capacity grows with the connection count. Set `tcp_buffer_size: 32768`
+for a lower-memory 32 KiB setting, or use `tcp_memory_bytes` to bound admission.
+A memory budget admits at most `tcp_memory_bytes / (4 * tcp_buffer_size)` flows;
+it does not include other process memory. WireGuard retains its separate
+32 KiB buffer default.
+
+**Upgrade note:** If `tcp_memory_bytes` is set without `tcp_buffer_size`, the
+new default lowers the memory-derived connection limit: a 32 MiB budget permits
+64 flows instead of 256. Previously valid budgets below 524,288 bytes now fail
+validation with the new default. Explicitly set `tcp_buffer_size: 32768` to
+retain the previous buffer size and admission calculation.
+
 When both TCP memory and connection caps are set, the lower effective
 connection count applies. These limits are separate from
 [process-wide admission](/config/global-settings/#admission-caps).
+
+UDP replies wait for capacity in the bounded response and TUN-output queues
+rather than dropping packets when a burst briefly fills either queue. Upload
+queues hold up to 128 packets per stage (TUN ingress, source session, and
+destination); saturation still drops packets so a slow destination cannot block
+other flows. Kernel UDP buffers and TUN device queues can also drop packets
+under overload.
+`max_udp_queued_bytes` limits queued upload payloads, not all UDP memory;
+`tcp_buffer_size` does not change UDP queue capacity.
 
 `segmentation_offload` controls TCPv4 transmit offload on a created Linux
 device. Omission tries it automatically and falls back to ordinary packets if
@@ -228,12 +251,51 @@ mark-aware reverse-path filtering.
 No universal VPN, firewall, resolver-manager, or distribution compatibility is
 promised.
 
-Reload retains the interface, capture, and redirect listener identities. Network
-topology changes require restart and are rejected before retiring live workers.
+Reload retains the interface, capture, and redirect listener identities. Managed
+TUN topology configuration changes require restart and are rejected before retiring live workers.
 Ordinary worker reloads can reset existing connections and briefly interrupt
-traffic, but do not disable capture. Failed candidates roll back on the same
+traffic, but do not disable capture. Failed ordinary reloads roll back on the same
 network lease. Unexpected owned routing changes or a missing private firewall
 table cause orderly shutdown. Resolver-setting changes do not.
+
+After startup, changes to the underlying main-table default path, gateway, or
+explicit preferred source, and loss of the selected source address, trigger recovery
+in place. Ordinary IPv6 privacy-address rotation does not reset existing flows.
+Both IP families are monitored. A
+complete outage pauses forwarding until an underlay returns; temporary recovery
+failures are retried without removing capture. Recovery rebuilds DNS and proxy
+transports from the accepted in-memory configuration, not from edited files.
+Recovery shares worker startup and activation with configuration reload. After
+starting workers, it rechecks the underlay before resuming the controller, starting
+certificate workers, and admitting TCP/Unix connections. This is not an atomic
+barrier for all forwarding: managed ingress, QUIC, and WireGuard can start earlier.
+DNS bootstrap uses the configured lookup deadlines; slow or unbounded lookups
+can delay recovery, but shutdown remains cancellable.
+Explicit reloads wait while offline and can replace a configuration that prevents
+workers from restarting once an underlay is available, without first rebuilding
+the accepted DNS configuration.
+If worker startup or activation rejects a recovery reload while the underlay is
+stable, its workers are cleaned up and forwarding remains paused. Recovery
+schedules the accepted configuration for another attempt after two seconds, rather
+than immediately rolling back or re-reading the rejected file. An underlay change
+detected after worker startup instead keeps the reload pending for a later attempt,
+without another file edit or SIGHUP. Cleanup and network ownership failures still
+cause shutdown.
+The TUN, REDIRECT ports, fake-IP mappings, and explicit selector choices remain
+owned and retained. WireGuard peer hostnames are refreshed best-effort; a failed
+refresh retains the previous endpoints rather than blocking unrelated workers. Old flows,
+pending connections, and connections draining from earlier reloads are cancelled.
+Applications must reconnect; requests are not replayed and existing TCP/QUIC
+sessions are not migrated. TUN TCP resets are best-effort.
+
+Detection uses netlink notifications and periodic checks, with a short settling
+delay. It observes kernel route/source selection for representative off-link
+destinations, not Internet reachability or every destination-specific policy.
+Packet loss, captive portals, or a Wi-Fi change that preserves the observed
+routing and carrier state may not trigger recovery. Explicit `bind_interface`
+and listen-address settings remain fixed; they are never silently moved to another
+interface. A reset affects all proxy workers in this process, including local
+listeners.
 
 shoes exclusively owns its token-named `inet` nftables table, including all of its
 contents. Do not add rules, chains, or sets to that table: external changes inside

@@ -6,19 +6,70 @@ pub(crate) const MANAGED_STATE_DIRECTORY: &str = "/run/shoes";
 
 use std::io;
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_NETWORK: std::cell::RefCell<Option<NetworkSession>>;
+}
+
+pub(crate) struct NetworkTopology {
+    #[cfg(target_os = "linux")]
+    spec: Option<linux::Spec>,
+    #[cfg(target_os = "linux")]
+    ingress: Option<std::sync::Arc<linux::Ingress>>,
+}
+
+impl NetworkTopology {
+    pub(crate) fn validate(&self, configs: &[crate::config::ResolvedConfig]) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if linux::Spec::from_resolved_configs(configs)? != self.spec {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                if self.spec.is_none() {
+                    "enabling managed TUN requires a restart"
+                } else {
+                    "managed TUN topology changes require a restart"
+                },
+            ));
+        }
+        let _ = configs;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ingress(&self) -> Option<std::sync::Arc<linux::Ingress>> {
+        self.ingress.clone()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct NetworkSession {
+    #[cfg(test)]
+    test_changed: bool,
+    #[cfg(test)]
+    test_available: Option<bool>,
     #[cfg(target_os = "linux")]
     session: Option<linux::Session>,
     #[cfg(test)]
     test_events: Option<(
-        tokio::sync::mpsc::Receiver<()>,
+        tokio::sync::mpsc::Receiver<Option<bool>>,
         tokio::sync::mpsc::Sender<()>,
     )>,
 }
 
 impl NetworkSession {
+    pub(crate) fn topology(&self) -> NetworkTopology {
+        NetworkTopology {
+            #[cfg(target_os = "linux")]
+            spec: self.session.as_ref().map(|session| session.spec().clone()),
+            #[cfg(target_os = "linux")]
+            ingress: self.ingress(),
+        }
+    }
     pub(crate) async fn prepare(configs: &[crate::config::Config]) -> io::Result<Self> {
+        #[cfg(test)]
+        if let Ok(Some(network)) = TEST_NETWORK.try_with(|network| network.borrow_mut().take()) {
+            return Ok(network);
+        }
         #[cfg(target_os = "linux")]
         {
             if let Some(spec) = linux::Spec::from_configs(configs)? {
@@ -26,6 +77,10 @@ impl NetworkSession {
                     session: Some(linux::Session::prepare(spec).await?),
                     #[cfg(test)]
                     test_events: None,
+                    #[cfg(test)]
+                    test_changed: false,
+                    #[cfg(test)]
+                    test_available: None,
                 });
             }
         }
@@ -33,20 +88,23 @@ impl NetworkSession {
         Ok(Self::default())
     }
 
-    pub(crate) fn validate(&self, configs: &[crate::config::ResolvedConfig]) -> io::Result<()> {
+    pub(crate) fn monitors_underlay(&self) -> bool {
         #[cfg(target_os = "linux")]
-        match &self.session {
-            Some(session) => return session.validate(configs),
-            None if linux::Spec::from_resolved_configs(configs)?.is_some() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "enabling managed TUN requires a restart",
-                ));
+        {
+            #[cfg(test)]
+            if self.test_events.is_some() {
+                return true;
             }
-            _ => {}
+            self.session.is_some()
         }
-        let _ = configs;
-        Ok(())
+        #[cfg(all(not(target_os = "linux"), test))]
+        {
+            self.test_events.is_some()
+        }
+        #[cfg(all(not(target_os = "linux"), not(test)))]
+        {
+            false
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -73,7 +131,11 @@ impl NetworkSession {
     pub(crate) async fn changed(&mut self) {
         #[cfg(test)]
         if let Some((changes, _)) = &mut self.test_events {
-            changes.recv().await.unwrap();
+            let event = changes.recv().await.unwrap();
+            self.test_changed = event.is_some();
+            if let Some(available) = event {
+                self.test_available = Some(available);
+            }
             return;
         }
         #[cfg(target_os = "linux")]
@@ -83,22 +145,49 @@ impl NetworkSession {
         std::future::pending().await
     }
 
-    pub(crate) async fn reconcile(&mut self) -> io::Result<()> {
+    pub(crate) fn available(&self) -> bool {
         #[cfg(test)]
-        if let Some((_, reconciled)) = &self.test_events {
-            reconciled.send(()).await.unwrap();
-            return Ok(());
+        if let Some(available) = self.test_available {
+            return available;
         }
         #[cfg(target_os = "linux")]
-        if let Some(session) = &mut self.session {
-            session.reconcile().await?;
+        if let Some(session) = &self.session {
+            return session.available();
+        }
+        true
+    }
+
+    pub(crate) fn refresh_bootstrap(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.session {
+            session.refresh_bootstrap()?;
         }
         Ok(())
     }
 
+    pub(crate) async fn reconcile(&mut self) -> io::Result<bool> {
+        #[cfg(test)]
+        if let Some((changes, reconciled)) = &mut self.test_events {
+            // Reconciliation observes changes that arrived while worker startup was running.
+            while let Ok(event) = changes.try_recv() {
+                self.test_changed |= event.is_some();
+                if let Some(available) = event {
+                    self.test_available = Some(available);
+                }
+            }
+            let _ = reconciled.try_send(());
+            return Ok(std::mem::take(&mut self.test_changed));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &mut self.session {
+            return session.reconcile().await;
+        }
+        Ok(false)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_events(
-        changes: tokio::sync::mpsc::Receiver<()>,
+        changes: tokio::sync::mpsc::Receiver<Option<bool>>,
         reconciled: tokio::sync::mpsc::Sender<()>,
     ) -> Self {
         Self {
@@ -144,4 +233,18 @@ pub(crate) fn validate_config(configs: &[crate::config::ResolvedConfig]) -> io::
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NetworkSession;
+
+    #[test]
+    fn underlay_monitoring_requires_a_session_or_test_events() {
+        assert!(!NetworkSession::default().monitors_underlay());
+
+        let (_, changes) = tokio::sync::mpsc::channel(1);
+        let (reconciled, _) = tokio::sync::mpsc::channel(1);
+        assert!(NetworkSession::with_test_events(changes, reconciled).monitors_underlay());
+    }
 }
